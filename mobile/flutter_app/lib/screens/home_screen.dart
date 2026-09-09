@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../core/flova_mark.dart';
 import '../core/tokens.dart';
+import 'progress_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -61,7 +62,9 @@ class _HomeScreenState extends State<HomeScreen> {
           SizedBox(
             width: double.infinity,
             child: FilledButton.icon(
-              onPressed: () {},
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const ProgressScreen()),
+              ),
               icon: const Icon(Icons.send),
               label: const Text('Send a file'),
             ),
@@ -93,21 +96,24 @@ class _HomeScreenState extends State<HomeScreen> {
       padding: const EdgeInsets.symmetric(vertical: 12),
       child: Row(children: [
         Container(
-          width: 36, height: 36,
+          width: 36,
+          height: 36,
           decoration: BoxDecoration(color: FlovaTokens.section, borderRadius: BorderRadius.circular(FlovaTokens.rControl)),
           child: const Icon(Icons.description_outlined, color: FlovaTokens.ink2, size: 18),
         ),
         const SizedBox(width: 12),
-        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(name, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: FlovaTokens.ink)),
-          const SizedBox(height: 2),
-          Text(size, style: const TextStyle(fontSize: 12, color: FlovaTokens.ink3)),
-        ])),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(name, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: FlovaTokens.ink)),
+            const SizedBox(height: 2),
+            Text(size, style: const TextStyle(fontSize: 12, color: FlovaTokens.ink3)),
+          ]),
+        ),
         Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
           Text(time, style: const TextStyle(fontSize: 12, color: FlovaTokens.ink3)),
           const SizedBox(height: 2),
           const Text('Completed', style: TextStyle(fontSize: 12, color: FlovaTokens.success, fontWeight: FontWeight.w500)),
-        ])
+        ]),
       ]),
     );
   }
