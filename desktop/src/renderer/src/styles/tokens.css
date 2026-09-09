@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+@theme {
+  /* Flova tokens — source of truth: docs/DESIGN.md */
+  --color-canvas: #ffffff;
+  --color-surface: #f7f7f8;
+  --color-section: #f3f4f6;
+  --color-accent: #2563eb;
+  --color-accent-hover: #1d4ed8;
+  --color-accent-soft: #eff6ff;
+  --color-violet: #6366f1;
+  --color-success: #16a34a;
+  --color-warning: #f59e0b;
+  --color-error: #ef4444;
+  --color-ink: #111827;
+  --color-ink-2: #6b7280;
+  --color-ink-3: #9ca3af;
+  --color-line: #e5e7eb;
+
+  --radius-control: 12px;
+  --radius-card: 16px;
+  --radius-panel: 20px;
+
+  --font-sans: "Inter", "SF Pro Display", system-ui, -apple-system, "Segoe UI", sans-serif;
+
+  --shadow-soft: 0 1px 2px rgb(17 24 39 / 0.04), 0 4px 12px rgb(17 24 39 / 0.04);
+
+  --animate-pulse-dot: pulse-dot 2s ease-in-out infinite;
+  --animate-halo: halo 2.4s ease-out infinite;
+
+  @keyframes pulse-dot { 0%, 100% { opacity: .35 } 50% { opacity: 1 } }
+  @keyframes halo { 0% { transform: scale(1); opacity: .6 } 100% { transform: scale(1.12); opacity: 0 } }
+}
+
+html, body, #root { height: 100%; }
+body { @apply bg-canvas text-ink font-sans antialiased; }
