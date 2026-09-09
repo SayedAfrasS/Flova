@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import '../core/flova_mark.dart';
 import '../core/tokens.dart';
-import 'stub_screen.dart';
+import 'home_screen.dart';
 
 class WelcomeScreen extends StatelessWidget {
   const WelcomeScreen({super.key});
@@ -29,7 +29,7 @@ class WelcomeScreen extends StatelessWidget {
               const SizedBox(height: 32),
               FilledButton(
                 onPressed: () => Navigator.of(context).push(MaterialPageRoute(
-                  builder: (_) => const StubScreen(title: 'Scan laptop code'),
+                  builder: (_) => const HomeScreen(),
                 )),
                 child: const Text('Scan laptop code'),
               ),
