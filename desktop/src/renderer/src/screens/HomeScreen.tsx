@@ -25,7 +25,7 @@ export function HomeScreen() {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-12">
-        <button onClick={() => go("progress")} className="group text-left p-6 border border-line rounded-card bg-canvas hover:bg-surface transition-colors">
+        <button onClick={() => go("send")} className="group text-left p-6 border border-line rounded-card bg-canvas hover:bg-surface transition-colors">
           <div className="size-10 rounded-full bg-accent-soft flex items-center justify-center mb-4 group-hover:bg-accent transition-colors">
             <svg viewBox="0 0 24 24" className="size-5 text-accent group-hover:text-white transition-colors" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" /></svg>
           </div>
@@ -33,7 +33,7 @@ export function HomeScreen() {
           <p className="text-[14px] text-ink-2">Choose a file from your laptop and send it to your phone.</p>
         </button>
 
-        <button onClick={() => {}} className="group text-left p-6 border border-line rounded-card bg-canvas hover:bg-surface transition-colors">
+        <button onClick={() => go("receive")} className="group text-left p-6 border border-line rounded-card bg-canvas hover:bg-surface transition-colors">
           <div className="size-10 rounded-full bg-section flex items-center justify-center mb-4">
             <svg viewBox="0 0 24 24" className="size-5 text-ink-2" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12" /><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" /></svg>
           </div>

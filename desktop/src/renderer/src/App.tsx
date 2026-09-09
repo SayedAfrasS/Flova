@@ -2,6 +2,8 @@ import type { ComponentType } from "react";
 import { useNav, type Screen } from "./state/nav";
 import { ConnectScreen } from "./screens/ConnectScreen";
 import { HomeScreen } from "./screens/HomeScreen";
+import { SendScreen } from "./screens/SendScreen";
+import { ReceiveScreen } from "./screens/ReceiveScreen";
 import { ProgressScreen } from "./screens/ProgressScreen";
 import { CompleteScreen } from "./screens/CompleteScreen";
 import { Sidebar } from "./components/Sidebar";
@@ -9,7 +11,8 @@ import { Sidebar } from "./components/Sidebar";
 const SCREENS: Record<Screen, ComponentType> = {
   connect: ConnectScreen,
   home: HomeScreen,
-  send: () => <div className="p-8 text-center text-ink-2">File selection screen (next increment)</div>,
+  send: SendScreen,
+  receive: ReceiveScreen,
   progress: ProgressScreen,
   complete: CompleteScreen,
   queue: () => <div className="p-8 text-center text-ink-2">Transfer queue (coming soon)</div>,
