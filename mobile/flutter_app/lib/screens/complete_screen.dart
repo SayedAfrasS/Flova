@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import '../core/tokens.dart';
+import '../core/transfer.dart';
 
 class CompleteScreen extends StatelessWidget {
-  const CompleteScreen({super.key});
+  final TransferInfo info;
+  const CompleteScreen({super.key, required this.info});
 
   @override
   Widget build(BuildContext context) {
@@ -19,8 +21,7 @@ class CompleteScreen extends StatelessWidget {
                   tween: Tween(begin: 0.0, end: 1.0),
                   duration: const Duration(milliseconds: 450),
                   curve: Curves.easeOutBack,
-                  builder: (context, value, child) =>
-                      Transform.scale(scale: 0.5 + 0.5 * value, child: child),
+                  builder: (context, value, child) => Transform.scale(scale: 0.5 + 0.5 * value, child: child),
                   child: Container(
                     width: 64,
                     height: 64,
@@ -42,17 +43,17 @@ class CompleteScreen extends StatelessWidget {
                     border: Border.all(color: FlovaTokens.line),
                     borderRadius: BorderRadius.circular(FlovaTokens.rCard),
                   ),
-                  child: const Column(
+                  child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('Vacation Video.mp4',
-                          style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: FlovaTokens.ink)),
-                      SizedBox(height: 2),
-                      Text('1.8 GB', style: TextStyle(fontSize: 13, color: FlovaTokens.ink2)),
-                      SizedBox(height: 12),
-                      SizedBox(height: 1, child: ColoredBox(color: FlovaTokens.line)),
-                      SizedBox(height: 12),
-                      Text('Saved to Downloads', style: TextStyle(fontSize: 13, color: FlovaTokens.ink2)),
+                      Text(info.name,
+                          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: FlovaTokens.ink)),
+                      const SizedBox(height: 2),
+                      Text(info.size, style: const TextStyle(fontSize: 13, color: FlovaTokens.ink2)),
+                      const SizedBox(height: 12),
+                      const SizedBox(height: 1, child: ColoredBox(color: FlovaTokens.line)),
+                      const SizedBox(height: 12),
+                      const Text('Saved to Downloads', style: TextStyle(fontSize: 13, color: FlovaTokens.ink2)),
                     ],
                   ),
                 ),

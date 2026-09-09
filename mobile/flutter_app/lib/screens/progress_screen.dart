@@ -2,18 +2,18 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../core/tokens.dart';
+import '../core/transfer.dart';
 import 'complete_screen.dart';
 
 class ProgressScreen extends StatefulWidget {
-  const ProgressScreen({super.key});
+  final TransferInfo info;
+  const ProgressScreen({super.key, required this.info});
 
   @override
   State<ProgressScreen> createState() => _ProgressScreenState();
 }
 
 class _ProgressScreenState extends State<ProgressScreen> with SingleTickerProviderStateMixin {
-  static const double totalBytes = 1.8 * 1024 * 1024 * 1024;
-
   double _progress = 0;
   double _speed = 45;
   bool _paused = false;
@@ -41,7 +41,7 @@ class _ProgressScreenState extends State<ProgressScreen> with SingleTickerProvid
         Future.delayed(const Duration(milliseconds: 700), () {
           if (mounted) {
             Navigator.of(context).pushReplacement(
-              MaterialPageRoute(builder: (_) => const CompleteScreen()),
+              MaterialPageRoute(builder: (_) => CompleteScreen(info: widget.info)),
             );
           }
         });
@@ -76,15 +76,16 @@ class _ProgressScreenState extends State<ProgressScreen> with SingleTickerProvid
   @override
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
-    final transferred = totalBytes * _progress;
-    final secondsLeft = math.max(1, ((totalBytes - transferred) / (_speed * 1024 * 1024)).round());
+    final transferred = widget.info.bytes * _progress;
+    final secondsLeft =
+        math.max(1, ((widget.info.bytes - transferred) / (_speed * 1024 * 1024)).round());
 
     return Scaffold(
       appBar: AppBar(
         backgroundColor: FlovaTokens.canvas,
         surfaceTintColor: Colors.transparent,
-        title: const Text('Sending file',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: FlovaTokens.ink)),
+        title: Text(widget.info.sending ? 'Sending file' : 'Receiving file',
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: FlovaTokens.ink)),
       ),
       body: SafeArea(
         child: Column(
@@ -92,9 +93,9 @@ class _ProgressScreenState extends State<ProgressScreen> with SingleTickerProvid
           children: [
             const Icon(Icons.description_outlined, size: 40, color: FlovaTokens.accent),
             const SizedBox(height: 8),
-            Text('Vacation Video.mp4', style: text.headlineMedium),
+            Text(widget.info.name, style: text.headlineMedium, textAlign: TextAlign.center),
             const SizedBox(height: 4),
-            Text('1.8 GB', style: text.bodyMedium),
+            Text(widget.info.size, style: text.bodyMedium),
             const SizedBox(height: 32),
             SizedBox(
               width: 200,
@@ -104,7 +105,8 @@ class _ProgressScreenState extends State<ProgressScreen> with SingleTickerProvid
                 children: [
                   CustomPaint(size: const Size(200, 200), painter: _RingPainter(_progress)),
                   Text('${(_progress * 100).round()}%',
-                      style: const TextStyle(fontSize: 36, fontWeight: FontWeight.w600, color: FlovaTokens.ink)),
+                      style: const TextStyle(
+                          fontSize: 36, fontWeight: FontWeight.w600, color: FlovaTokens.ink)),
                 ],
               ),
             ),
@@ -138,7 +140,7 @@ class _ProgressScreenState extends State<ProgressScreen> with SingleTickerProvid
               ),
             ),
             const SizedBox(height: 24),
-            Text('${_fmt(transferred)} of ${_fmt(totalBytes)}',
+            Text('${_fmt(transferred)} of ${_fmt(widget.info.bytes)}',
                 style: text.bodyLarge?.copyWith(color: FlovaTokens.ink)),
             const SizedBox(height: 4),
             Text(_paused ? 'Paused' : '${_speed.round()} MB/s', style: text.bodyMedium),
