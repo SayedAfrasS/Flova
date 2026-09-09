@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 import '../core/flova_mark.dart';
 import '../core/tokens.dart';
-import 'progress_screen.dart';
+import 'receive_screen.dart';
+import 'send_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -63,7 +64,7 @@ class _HomeScreenState extends State<HomeScreen> {
             width: double.infinity,
             child: FilledButton.icon(
               onPressed: () => Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const ProgressScreen()),
+                MaterialPageRoute(builder: (_) => const SendScreen()),
               ),
               icon: const Icon(Icons.send),
               label: const Text('Send a file'),
@@ -73,7 +74,9 @@ class _HomeScreenState extends State<HomeScreen> {
           SizedBox(
             width: double.infinity,
             child: OutlinedButton.icon(
-              onPressed: () {},
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const ReceiveScreen()),
+              ),
               icon: const Icon(Icons.download),
               label: const Text('Receive a file'),
             ),
