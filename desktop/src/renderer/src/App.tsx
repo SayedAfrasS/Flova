@@ -1,35 +1,24 @@
-import Versions from './components/Versions'
-import electronLogo from './assets/electron.svg'
+import { ConnectScreen } from "./screens/ConnectScreen";
+import { Button } from "./components/primitives";
+import { useNav, type Screen } from "./state/nav";
 
-function App(): React.JSX.Element {
-  const ipcHandle = (): void => window.electron.ipcRenderer.send('ping')
+const TITLES: Partial<Record<Screen, string>> = {
+  home: "Your phone is connected",
+  settings: "Settings",
+  history: "History",
+};
+
+export default function App() {
+  const screen = useNav((s) => s.screen);
+  const go = useNav((s) => s.go);
+
+  if (screen === "connect") return <ConnectScreen />;
 
   return (
-    <>
-      <img alt="logo" className="logo" src={electronLogo} />
-      <div className="creator">Powered by electron-vite</div>
-      <div className="text">
-        Build an Electron app with <span className="react">React</span>
-        &nbsp;and <span className="ts">TypeScript</span>
-      </div>
-      <p className="tip">
-        Please try pressing <code>F12</code> to open the devTool
-      </p>
-      <div className="actions">
-        <div className="action">
-          <a href="https://electron-vite.org/" target="_blank" rel="noreferrer">
-            Documentation
-          </a>
-        </div>
-        <div className="action">
-          <a target="_blank" rel="noreferrer" onClick={ipcHandle}>
-            Send IPC
-          </a>
-        </div>
-      </div>
-      <Versions></Versions>
-    </>
-  )
+    <main className="flex h-full flex-col items-center justify-center gap-4">
+      <h1 className="text-[28px] font-semibold tracking-tight">{TITLES[screen] ?? screen}</h1>
+      <p className="text-[14px] text-ink-2">Screen lands in the next Phase 2 increment.</p>
+      <Button variant="secondary" onClick={() => go("connect")}>Back</Button>
+    </main>
+  );
 }
-
-export default App
