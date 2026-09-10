@@ -1,15 +1,17 @@
 /// WORKFLOW OF THIS FILE:
-/// 1. This is the mobile home shell: it owns the bottom navigation bar.
-/// 2. Tab 0 = Home content (built inside this file).
-/// 3. Tab 1 = Transfers queue screen (live moving list).
-/// 4. Tab 2 = History screen (old transfers by day).
-/// 5. Tab 3 = Settings screen (grouped preferences list).
-/// 6. Send / Receive buttons open the Send and Receive screens.
+/// 1. Mobile home shell that owns the bottom navigation bar.
+/// 2. Tab 0 = Home content built inside this file.
+/// 3. Tab 1 = Transfers queue screen.
+/// 4. Tab 2 = History screen.
+/// 5. Tab 3 = Settings screen.
+/// 6. The connected-device label uses the real peerName from the laptop,
+///    passed in when this screen is pushed from ScannerScreen.
+/// 7. Send / Receive buttons open their respective screens.
 ///
 /// CLASSES / FUNCTIONS:
-///  - HomeScreen          : owns the selected tab index.
-///  - _buildHomeContent() : builds the Home tab content.
-///  - _buildTransferItem(): builds one recent-transfer row on Home.
+///  - HomeScreen           : owns the selected tab index.
+///  - _buildHomeContent()  : builds the Home tab.
+///  - _buildTransferItem() : builds one row of the Recent transfers list.
 import 'package:flutter/material.dart';
 import '../core/flova_mark.dart';
 import '../core/tokens.dart';
@@ -20,7 +22,8 @@ import 'settings_screen.dart';
 import 'transfers_screen.dart';
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  final String peerName;
+  const HomeScreen({super.key, this.peerName = 'Laptop'});
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -33,7 +36,6 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
 
-    // pick the body for the selected tab
     Widget bodyContent;
     switch (_selectedIndex) {
       case 0:
@@ -81,15 +83,13 @@ class _HomeScreenState extends State<HomeScreen> {
           Row(children: [
             Container(width: 8, height: 8, decoration: const BoxDecoration(color: FlovaTokens.success, shape: BoxShape.circle)),
             const SizedBox(width: 6),
-            Text('Afras\'s Laptop', style: textTheme.bodyLarge?.copyWith(color: FlovaTokens.ink2)),
+            Text(widget.peerName, style: textTheme.bodyLarge?.copyWith(color: FlovaTokens.ink2)),
           ]),
           const SizedBox(height: 32),
           SizedBox(
             width: double.infinity,
             child: FilledButton.icon(
-              onPressed: () => Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const SendScreen()),
-              ),
+              onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SendScreen())),
               icon: const Icon(Icons.send),
               label: const Text('Send a file'),
             ),
@@ -98,9 +98,7 @@ class _HomeScreenState extends State<HomeScreen> {
           SizedBox(
             width: double.infinity,
             child: OutlinedButton.icon(
-              onPressed: () => Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => const ReceiveScreen()),
-              ),
+              onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const ReceiveScreen())),
               icon: const Icon(Icons.download),
               label: const Text('Receive a file'),
             ),
