@@ -1,8 +1,22 @@
+/// WORKFLOW OF THIS FILE:
+/// 1. This is the mobile home shell: it owns the bottom navigation bar.
+/// 2. Tab 0 = Home content (built inside this file).
+/// 3. Tab 1 = Transfers queue screen (live moving list).
+/// 4. Tab 2 = History screen (old transfers by day).
+/// 5. Tab 3 = Settings (comes in the next increment).
+/// 6. Send / Receive buttons open the Send and Receive screens.
+///
+/// CLASSES / FUNCTIONS:
+///  - HomeScreen          : owns the selected tab index.
+///  - _buildHomeContent() : builds the Home tab content.
+///  - _buildTransferItem(): builds one recent-transfer row on Home.
 import 'package:flutter/material.dart';
 import '../core/flova_mark.dart';
 import '../core/tokens.dart';
+import 'history_screen.dart';
 import 'receive_screen.dart';
 import 'send_screen.dart';
+import 'transfers_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -18,9 +32,18 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
 
-    Widget bodyContent = _selectedIndex == 0
-        ? _buildHomeContent(context, textTheme)
-        : Center(child: Text('Coming soon', style: textTheme.bodyLarge));
+    // pick the body for the selected tab
+    Widget bodyContent;
+    switch (_selectedIndex) {
+      case 0:
+        bodyContent = _buildHomeContent(context, textTheme);
+      case 1:
+        bodyContent = const TransfersScreen();
+      case 2:
+        bodyContent = const HistoryScreen();
+      default:
+        bodyContent = Center(child: Text('Coming soon', style: textTheme.bodyLarge));
+    }
 
     return Scaffold(
       body: SafeArea(child: bodyContent),
