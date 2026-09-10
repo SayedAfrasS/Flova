@@ -1,14 +1,13 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. Phase-3 connect screen: shows the QR placeholder and live status.
+ * 1. Phase-4 connect screen: shows the live QR code and connection status.
  * 2. On mount it asks the main process for the laptop's hotspot IP + port.
- * 3. It subscribes to peer-connected events from the main process.
- * 4. When a phone pairs, a "Continue to Home" button appears.
- * 5. The raw host:port is shown in a small dev-only line so the tester
- *    can type it into the phone's manual connect screen.
+ * 3. It generates a JSON payload matching the protocol and renders it as a QR code.
+ * 4. It subscribes to peer-connected events from the main process.
+ * 5. When a phone pairs, a "Continue to Home" button appears.
  *
  * FUNCTIONS:
- *  - ConnectScreen() : owns the live state + event subscriptions.
+ *  - ConnectScreen() : owns the live state, payload generation, and event subscriptions.
  */
 import { useEffect, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
@@ -19,7 +18,7 @@ type NetState = { host: string; port: number; state: "waiting" | "paired"; peerN
 
 export function ConnectScreen() {
   const go = useNav((s) => s.go);
-  const [net, setNet] = useState<NetState>({ host: "…", port: 8431, state: "waiting", peerName: null });
+  const [net, setNet] = useState<NetState>({ host: "0.0.0.0", port: 8431, state: "waiting", peerName: null });
 
   // boot: read server info + current state + peer name from main process
   useEffect(() => {
@@ -46,8 +45,14 @@ export function ConnectScreen() {
     };
   }, []);
 
-  // dev-only QR payload, matches the protocol doc
-  const demoQr = JSON.stringify({ v: 1, app: "flova", host: net.host, port: net.port, sid: "demo", pk: "" });
+  // real protocol payload that the mobile app will scan
+  const payload = JSON.stringify({
+    v: 1,
+    app: "flova",
+    host: net.host,
+    port: net.port,
+    sid: `session-${Date.now()}`,
+  });
 
   return (
     <div className="flex h-full flex-col">
@@ -71,7 +76,7 @@ export function ConnectScreen() {
         <div className="relative">
           <div aria-hidden="true" className="absolute -inset-3 rounded-panel bg-accent-soft animate-halo" />
           <div className="relative rounded-panel border border-line bg-canvas p-6 shadow-soft">
-            <QRCodeSVG value={demoQr} size={192} fgColor="#111827" bgColor="#FFFFFF" level="M" />
+            <QRCodeSVG value={payload} size={192} fgColor="#111827" bgColor="#FFFFFF" level="M" />
           </div>
         </div>
 
@@ -89,11 +94,6 @@ export function ConnectScreen() {
             Waiting for your phone
           </div>
         )}
-
-        {/* dev-only: manual-connect target for the phone during Phase 3 */}
-        <p className="text-[12px] text-ink-3">
-          Server: <span className="font-mono">{net.host}:{net.port}</span>
-        </p>
       </main>
 
       <footer className="pb-8 text-center text-[13px] text-ink-3">
