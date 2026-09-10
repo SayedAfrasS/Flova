@@ -3,7 +3,7 @@
 /// 2. Tab 0 = Home content (built inside this file).
 /// 3. Tab 1 = Transfers queue screen (live moving list).
 /// 4. Tab 2 = History screen (old transfers by day).
-/// 5. Tab 3 = Settings (comes in the next increment).
+/// 5. Tab 3 = Settings screen (grouped preferences list).
 /// 6. Send / Receive buttons open the Send and Receive screens.
 ///
 /// CLASSES / FUNCTIONS:
@@ -16,6 +16,7 @@ import '../core/tokens.dart';
 import 'history_screen.dart';
 import 'receive_screen.dart';
 import 'send_screen.dart';
+import 'settings_screen.dart';
 import 'transfers_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -42,7 +43,7 @@ class _HomeScreenState extends State<HomeScreen> {
       case 2:
         bodyContent = const HistoryScreen();
       default:
-        bodyContent = Center(child: Text('Coming soon', style: textTheme.bodyLarge));
+        bodyContent = const SettingsScreen();
     }
 
     return Scaffold(
