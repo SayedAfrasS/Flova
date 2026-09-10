@@ -16,6 +16,7 @@ import { ProgressScreen } from "./screens/ProgressScreen";
 import { CompleteScreen } from "./screens/CompleteScreen";
 import { QueueScreen } from "./screens/QueueScreen";
 import { HistoryScreen } from "./screens/HistoryScreen";
+import { SettingsScreen } from "./screens/SettingsScreen";
 import { Sidebar } from "./components/Sidebar";
 
 const SCREENS: Record<Screen, ComponentType> = {
@@ -27,7 +28,7 @@ const SCREENS: Record<Screen, ComponentType> = {
   complete: CompleteScreen,
   queue: QueueScreen,
   history: HistoryScreen,
-  settings: () => <div className="p-8 text-center text-ink-2">Settings (coming soon)</div>,
+  settings: SettingsScreen,
 };
 
 export default function App() {
