@@ -1,7 +1,16 @@
+/// WORKFLOW OF THIS FILE:
+/// 1. First screen of the mobile app (welcome).
+/// 2. "Scan laptop code" opens the Scanner screen.
+/// 3. "How it works" is a quiet placeholder for now.
+/// 4. The line art at the bottom is drawn by _LineArtPainter.
+///
+/// CLASSES / FUNCTIONS:
+///  - WelcomeScreen   : builds the welcome layout.
+///  - _LineArtPainter : draws phone + laptop + connecting curve.
 import 'package:flutter/material.dart';
 import '../core/flova_mark.dart';
 import '../core/tokens.dart';
-import 'home_screen.dart';
+import 'scanner_screen.dart';
 
 class WelcomeScreen extends StatelessWidget {
   const WelcomeScreen({super.key});
@@ -29,7 +38,7 @@ class WelcomeScreen extends StatelessWidget {
               const SizedBox(height: 32),
               FilledButton(
                 onPressed: () => Navigator.of(context).push(MaterialPageRoute(
-                  builder: (_) => const HomeScreen(),
+                  builder: (_) => const ScannerScreen(),
                 )),
                 child: const Text('Scan laptop code'),
               ),
