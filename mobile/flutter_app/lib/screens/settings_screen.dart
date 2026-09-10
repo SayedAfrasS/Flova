@@ -47,7 +47,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (result != null && result.isNotEmpty) {
       setState(() => _deviceName = result);
     }
-    controller.dispose();
+    // Note: we don't call controller.dispose() here to avoid race conditions
+    // with the widget tree cleanup. The garbage collector will handle it.
   }
 
   // one rounded panel; hairline dividers inserted between rows
