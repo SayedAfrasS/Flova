@@ -1,14 +1,53 @@
+/**
+ * WORKFLOW OF THIS FILE:
+ * 1. Phase-3 connect screen: shows the QR placeholder and live status.
+ * 2. On mount it asks the main process for the laptop's hotspot IP + port.
+ * 3. It subscribes to peer-connected events from the main process.
+ * 4. When a phone pairs, a "Continue to Home" button appears.
+ * 5. The raw host:port is shown in a small dev-only line so the tester
+ *    can type it into the phone's manual connect screen.
+ *
+ * FUNCTIONS:
+ *  - ConnectScreen() : owns the live state + event subscriptions.
+ */
+import { useEffect, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { Button, FlovaMark } from "../components/primitives";
 import { useNav } from "../state/nav";
 
-// Prototype only: real schema, dummy values. Real payload arrives in Phase 4.
-const DEMO_QR = JSON.stringify({
-  v: 1, app: "flova", host: "192.168.43.100", port: 8431, sid: "demo-session", pk: "demo-key",
-});
+type NetState = { host: string; port: number; state: "waiting" | "paired"; peerName: string | null };
 
 export function ConnectScreen() {
   const go = useNav((s) => s.go);
+  const [net, setNet] = useState<NetState>({ host: "…", port: 8431, state: "waiting", peerName: null });
+
+  // boot: read server info + current state + peer name from main process
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!window.flova) return;
+      const info = await window.flova.getServer();
+      const state = await window.flova.getState();
+      const peerName = await window.flova.getPeerName();
+      if (!cancelled) setNet({ host: info.host, port: info.port, state, peerName });
+    })();
+
+    // subscribe to live peer events
+    const offConnected = window.flova?.onPeerConnected((name) =>
+      setNet((prev) => ({ ...prev, state: "paired", peerName: name })),
+    );
+    const offDisconnected = window.flova?.onPeerDisconnected(() =>
+      setNet((prev) => ({ ...prev, state: "waiting", peerName: null })),
+    );
+    return () => {
+      cancelled = true;
+      offConnected?.();
+      offDisconnected?.();
+    };
+  }, []);
+
+  // dev-only QR payload, matches the protocol doc
+  const demoQr = JSON.stringify({ v: 1, app: "flova", host: net.host, port: net.port, sid: "demo", pk: "" });
 
   return (
     <div className="flex h-full flex-col">
@@ -17,39 +56,44 @@ export function ConnectScreen() {
           <FlovaMark />
           <span className="text-[15px] font-semibold tracking-tight">flova</span>
         </div>
-        <Button variant="ghost" aria-label="Settings" className="px-2" onClick={() => go("settings")}>
-          <svg viewBox="0 0 20 20" className="size-5" fill="none" stroke="currentColor" strokeWidth="1.5">
-            <circle cx="10" cy="10" r="3" />
-            <path d="M10 2v2.2M10 15.8V18M18 10h-2.2M4.2 10H2M15.7 4.3l-1.6 1.6M5.9 14.1l-1.6 1.6M15.7 15.7l-1.6-1.6M5.9 5.9 4.3 4.3" />
-          </svg>
-        </Button>
       </header>
 
       <main className="flex flex-1 flex-col items-center justify-center gap-6 px-8">
         <div className="text-center">
           <h1 className="text-[34px] font-semibold tracking-tight text-ink">Connect your phone</h1>
-          <p className="mt-2 text-[15px] text-ink-2">Open the app on your phone and scan this code.</p>
+          <p className="mt-2 text-[15px] text-ink-2">
+            {net.state === "paired"
+              ? `Connected to ${net.peerName ?? "your phone"}.`
+              : "Open the app on your phone and scan this code."}
+          </p>
         </div>
 
         <div className="relative">
           <div aria-hidden="true" className="absolute -inset-3 rounded-panel bg-accent-soft animate-halo" />
           <div className="relative rounded-panel border border-line bg-canvas p-6 shadow-soft">
-            <QRCodeSVG value={DEMO_QR} size={192} fgColor="#111827" bgColor="#FFFFFF" level="M" />
+            <QRCodeSVG value={demoQr} size={192} fgColor="#111827" bgColor="#FFFFFF" level="M" />
           </div>
         </div>
 
-        <div className="flex items-center gap-2 text-[13px] text-ink-2">
-          <span className="size-2 rounded-full bg-ink-3 animate-pulse-dot" />
-          Waiting for your phone
-        </div>
+        {net.state === "paired" ? (
+          <div className="flex flex-col items-center gap-3">
+            <div className="flex items-center gap-2 text-[13px] text-success">
+              <span className="size-2 rounded-full bg-success" />
+              Connected
+            </div>
+            <Button onClick={() => go("home")}>Continue to Home</Button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 text-[13px] text-ink-2">
+            <span className="size-2 rounded-full bg-ink-3 animate-pulse-dot" />
+            Waiting for your phone
+          </div>
+        )}
 
-        {/* dev-only, removed in Phase 4 */}
-        <button
-          onClick={() => go("home")}
-          className="text-[12px] text-ink-3 underline decoration-line underline-offset-4 transition-colors hover:text-ink-2"
-        >
-          Simulate phone scan (dev)
-        </button>
+        {/* dev-only: manual-connect target for the phone during Phase 3 */}
+        <p className="text-[12px] text-ink-3">
+          Server: <span className="font-mono">{net.host}:{net.port}</span>
+        </p>
       </main>
 
       <footer className="pb-8 text-center text-[13px] text-ink-3">
