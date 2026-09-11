@@ -4,13 +4,16 @@
 /// 3. Parses the JSON string to extract the laptop's IP and port.
 /// 4. Opens a TransportClient to connect to the laptop automatically.
 /// 5. Watches the connection state and shows Connecting, Paired, or Error UI.
-/// 6. On success, shows a Continue button to move to the Home screen.
+/// 6. On success, hands the TransportClient off to HomeScreen so it can
+///    monitor the connection and auto-reconnect if the laptop goes away.
+/// 7. The flashlight icon is a placeholder for Phase 4.
 ///
 /// CLASSES / FUNCTIONS:
 ///  - ScannerScreen    : owns the transport client, state, and camera controller.
 ///  - _handleScan      : processes the scanned barcode and triggers connection.
 ///  - _processQr       : parses the JSON and starts the socket connection.
 ///  - _retry           : resets the state and rebuilds the camera to try again.
+///  - _handOff         : pushes HomeScreen with ownership of the transport client.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show Platform;
@@ -38,13 +41,17 @@ class _ScannerScreenState extends State<ScannerScreen> {
   TransportState _state = TransportState.idle;
   String? _peerName;
   bool _isProcessing = false;
+  bool _handedOff = false;
   Key _scannerKey = UniqueKey();
 
   @override
   void dispose() {
     _sub?.cancel();
-    _transport.dispose();
     _cameraCtrl.dispose();
+    // only dispose transport if we never handed it off to HomeScreen
+    if (!_handedOff) {
+      _transport.dispose();
+    }
     super.dispose();
   }
 
@@ -87,7 +94,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
         platform: 'mobile',
       );
     } catch (e) {
-      // Ignore invalid JSON
+      // ignore invalid JSON
     }
   }
 
@@ -96,8 +103,20 @@ class _ScannerScreenState extends State<ScannerScreen> {
       _state = TransportState.idle;
       _isProcessing = false;
       _peerName = null;
-      _scannerKey = UniqueKey(); // Rebuilds the camera widget
+      _scannerKey = UniqueKey();
     });
+  }
+
+  void _handOff() {
+    _handedOff = true;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) => HomeScreen(
+          peerName: _peerName ?? 'Laptop',
+          transport: _transport,
+        ),
+      ),
+    );
   }
 
   @override
@@ -109,23 +128,16 @@ class _ScannerScreenState extends State<ScannerScreen> {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // Camera feed
           if (!showOverlay)
             MobileScanner(
               key: _scannerKey,
               controller: _cameraCtrl,
               onDetect: _handleScan,
             ),
-
-          // White overlay when connecting/paired/error
-          if (showOverlay)
-            Container(color: FlovaTokens.canvas),
-
-          // Safe area content
+          if (showOverlay) Container(color: FlovaTokens.canvas),
           SafeArea(
             child: Column(
               children: [
-                // Top bar
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                   child: Row(
@@ -138,14 +150,11 @@ class _ScannerScreenState extends State<ScannerScreen> {
                     ],
                   ),
                 ),
-
                 Expanded(
                   child: Center(
                     child: showOverlay ? _buildStatusView(text) : _buildScanningGuide(text),
                   ),
                 ),
-
-                // Bottom controls (flashlight)
                 if (!showOverlay)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 32),
@@ -179,12 +188,11 @@ class _ScannerScreenState extends State<ScannerScreen> {
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           const SizedBox(height: 40),
-          Text('Scan laptop code',
-            style: text.headlineMedium?.copyWith(color: Colors.white)),
+          Text('Scan laptop code', style: text.headlineMedium?.copyWith(color: Colors.white)),
           const SizedBox(height: 8),
           Text('Point your camera at the QR code shown on your laptop.',
-            textAlign: TextAlign.center,
-            style: TextStyle(fontSize: 14, color: Colors.white.withValues(alpha: 0.7))),
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 14, color: Colors.white.withValues(alpha: 0.7))),
         ],
       ),
     );
@@ -202,31 +210,20 @@ class _ScannerScreenState extends State<ScannerScreen> {
           const SizedBox(height: 8),
           Text(_statusSubtitle(), style: text.bodyMedium, textAlign: TextAlign.center),
           const SizedBox(height: 32),
-
           if (_state == TransportState.paired) ...[
             SizedBox(
               width: double.infinity,
-              child: FilledButton(
-                onPressed: () => Navigator.of(context).pushReplacement(
-                  MaterialPageRoute(builder: (_) => HomeScreen(peerName: _peerName ?? 'Laptop')),
-                ),
-                child: const Text('Continue'),
-              ),
+              child: FilledButton(onPressed: _handOff, child: const Text('Continue')),
             ),
             const SizedBox(height: 12),
           ],
-
           if (_state == TransportState.error || _state == TransportState.disconnected) ...[
             SizedBox(
               width: double.infinity,
-              child: OutlinedButton(
-                onPressed: _retry,
-                child: const Text('Try again'),
-              ),
+              child: OutlinedButton(onPressed: _retry, child: const Text('Try again')),
             ),
             const SizedBox(height: 12),
           ],
-
           if (_state != TransportState.paired)
             SizedBox(
               width: double.infinity,
@@ -243,20 +240,22 @@ class _ScannerScreenState extends State<ScannerScreen> {
   Widget _statusIcon() {
     if (_state == TransportState.connecting || _state == TransportState.connected) {
       return const SizedBox(
-        width: 48, height: 48,
+        width: 48,
+        height: 48,
         child: CircularProgressIndicator(color: FlovaTokens.accent),
       );
     }
     if (_state == TransportState.paired) {
       return Container(
-        width: 64, height: 64,
+        width: 64,
+        height: 64,
         decoration: const BoxDecoration(color: Color(0x1A16A34A), shape: BoxShape.circle),
         child: const Icon(Icons.check_rounded, color: FlovaTokens.success, size: 32),
       );
     }
-    // error
     return Container(
-      width: 64, height: 64,
+      width: 64,
+      height: 64,
       decoration: const BoxDecoration(color: Color(0x1AEF4444), shape: BoxShape.circle),
       child: const Icon(Icons.close_rounded, color: FlovaTokens.error, size: 32),
     );
