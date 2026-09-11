@@ -1,3 +1,11 @@
+/**
+ * WORKFLOW OF THIS FILE:
+ * 1. Displays the real-time progress of an active file transfer.
+ * 2. On mount, reads the active transfer state via getCurrentTransfer() 
+ *    so it knows the real file name and total bytes to track.
+ * 3. Listens to IPC progress events to update the ring and speed dynamically.
+ * 4. Automatically navigates to the CompleteScreen when the transfer finishes.
+ */
 import { useEffect, useRef, useState } from "react";
 import { Button } from "../components/primitives";
 import { useNav } from "../state/nav";
@@ -26,81 +34,75 @@ function Ring({ pct }: { pct: number }) {
   );
 }
 
-const LaptopIcon = () => (
-  <svg viewBox="0 0 24 24" className="size-7 text-ink-2" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="5" width="18" height="11" rx="1.5" /><path d="M2 19h20" /></svg>
-);
-const PhoneIcon = () => (
-  <svg viewBox="0 0 24 24" className="size-7 text-ink-2" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="7" y="2" width="10" height="20" rx="2" /><line x1="12" y1="18" x2="12.01" y2="18" /></svg>
-);
-
 export function ProgressScreen() {
   const go = useNav((s) => s.go);
-  const file = useNav((s) => s.file);
-  const direction = useNav((s) => s.direction);
-  const sending = direction === "send";
-
-  const [progress, setProgress] = useState(0);
-  const [speed, setSpeed] = useState(45);
-  const [paused, setPaused] = useState(false);
-  const pausedRef = useRef(paused);
-  pausedRef.current = paused;
-  const doneRef = useRef(false);
+  const [fileName, setFileName] = useState("Preparing...");
+  const [transferred, setTransferred] = useState(0);
+  const [totalBytes, setTotalBytes] = useState(0);
+  const [isSending, setIsSending] = useState(true);
+  const [speed, setSpeed] = useState(0);
+  const lastUpdate = useRef(Date.now());
+  const lastBytes = useRef(0);
 
   useEffect(() => {
-    const id = setInterval(() => {
-      if (pausedRef.current || doneRef.current) return;
-      setSpeed(38 + Math.random() * 14);
-      setProgress((p) => {
-        const next = Math.min(1, p + 0.004 + Math.random() * 0.004);
-        if (next >= 1 && !doneRef.current) {
-          doneRef.current = true;
-          setTimeout(() => go("complete"), 700);
+    if (!window.flova) return;
+    let cancelled = false;
+
+    // Read the active transfer state on mount
+    window.flova.getCurrentTransfer().then(t => {
+      if (cancelled || !t) return;
+      setFileName(t.name);
+      setTotalBytes(t.size);
+      setIsSending(t.isSending);
+    });
+
+    const offStart = window.flova.onFileTransferStart(({ name, size, isSending: sending }) => {
+      setFileName(name); setTotalBytes(size); setIsSending(sending);
+    });
+
+    const offProgress = window.flova.onFileProgress(({ bytes }) => {
+      const now = Date.now();
+      const dt = (now - lastUpdate.current) / 1000;
+      
+      setTransferred(prev => {
+        const next = prev + bytes;
+        if (dt > 0.5) {
+          setSpeed((next - lastBytes.current) / dt);
+          lastUpdate.current = now;
+          lastBytes.current = next;
         }
         return next;
       });
-    }, 100);
-    return () => clearInterval(id);
+    });
+
+    const offDone = window.flova.onFileDone(() => {
+      setTimeout(() => go("complete"), 500);
+    });
+
+    return () => { cancelled = true; offStart(); offProgress(); offDone(); };
   }, [go]);
 
-  const pct = Math.round(progress * 100);
-  const transferred = file.bytes * progress;
-  const secondsLeft = Math.max(1, Math.round((file.bytes - transferred) / (speed * 1024 ** 2)));
+  const pct = totalBytes > 0 ? Math.min(100, Math.round((transferred / totalBytes) * 100)) : 0;
+  const secondsLeft = speed > 0 ? Math.max(1, Math.round((totalBytes - transferred) / speed)) : 0;
 
   return (
     <div className="flex w-full max-w-2xl mx-auto flex-col items-center justify-center gap-8 p-8">
-      <style>{`
-        @keyframes travel { 0% { left: 0%; opacity: 0 } 12% { opacity: 1 } 88% { opacity: 1 } 100% { left: 100%; opacity: 0 } }
-        .dot-travel { animation: travel 1.6s cubic-bezier(0.45, 0, 0.55, 1) infinite; }
-      `}</style>
-
       <header className="text-center">
-        <div className="flex items-center justify-center gap-2">
-          <svg viewBox="0 0 24 24" className="size-5 text-accent" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /></svg>
-          <h1 className="text-[20px] font-semibold tracking-tight text-ink">{file.name}</h1>
-        </div>
-        <p className="mt-1 text-[13px] text-ink-2">{file.size}</p>
+        <h1 className="text-[20px] font-semibold tracking-tight text-ink">
+          {isSending ? "Sending file" : "Receiving file"}
+        </h1>
+        <p className="mt-1 text-[14px] text-ink-2">{fileName}</p>
       </header>
 
       <Ring pct={pct} />
 
-      <div className="flex items-center gap-5">
-        {sending ? <LaptopIcon /> : <PhoneIcon />}
-        <div className="relative h-[2px] w-36 rounded-full bg-line">
-          <span className={`dot-travel absolute top-1/2 size-2 -translate-y-1/2 rounded-full bg-accent ${paused ? "[animation-play-state:paused]" : ""}`} />
-        </div>
-        {sending ? <PhoneIcon /> : <LaptopIcon />}
-      </div>
-
       <div className="space-y-1 text-center">
-        <p className="text-[14px] text-ink">{formatBytes(transferred)} of {formatBytes(file.bytes)}</p>
-        <p className="text-[13px] text-ink-2">{paused ? "Paused" : `${Math.round(speed)} MB/s`}</p>
-        <p className="text-[13px] text-ink-3">{paused ? "Transfer paused" : `About ${secondsLeft} seconds left`}</p>
+        <p className="text-[14px] text-ink">{formatBytes(transferred)} of {formatBytes(totalBytes)}</p>
+        <p className="text-[13px] text-ink-2">{speed > 0 ? `${formatBytes(speed)}/s` : "Calculating speed..."}</p>
+        <p className="text-[13px] text-ink-3">{speed > 0 ? `About ${secondsLeft} seconds left` : ""}</p>
       </div>
 
-      <div className="flex items-center gap-3">
-        <Button variant="secondary" onClick={() => setPaused((v) => !v)}>{paused ? "Resume" : "Pause"}</Button>
-        <Button variant="ghost" onClick={() => go("home")}>Cancel</Button>
-      </div>
+      <Button variant="ghost" onClick={() => go("home")}>Cancel</Button>
     </div>
   );
 }

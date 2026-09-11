@@ -1,18 +1,13 @@
 /**
  * WORKFLOW OF THIS FILE:
  * 1. Allows the user to pick a file from their laptop using the native OS dialog.
- * 2. Displays the selected file's name and size.
- * 3. When "Send file" is clicked, it triggers the real file transfer via IPC.
+ * 2. Uses the file:getStats IPC call to read the real file name and size from disk.
+ * 3. When "Send file" is clicked, it triggers the offerFile() handshake.
  * 4. Navigates to the ProgressScreen to show real-time transfer stats.
- *
- * FUNCTIONS:
- *  - SendScreen()   : owns the selected file state and triggers the transfer.
- *  - formatBytes()  : formats byte counts into human-readable strings (MB, GB).
  */
 import { useState } from "react";
 import { Button } from "../components/primitives";
 import { useNav } from "../state/nav";
-import * as path from "path";
 
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
@@ -32,20 +27,18 @@ export function SendScreen() {
     const picked = await window.flova.pickFile();
     if (picked) {
       setFilePath(picked);
-      setFileName(picked.split(/[\\/]/).pop() || "Unknown file");
-      // We don't have file size from IPC easily, so we'll fake it for the UI 
-      // or just rely on the progress screen to calculate it from bytes received.
-      // For Phase 6 simplicity, we'll pass a dummy size and let progress track real bytes.
-      setFileSize(100 * 1024 * 1024); // Dummy 100MB for UI layout
+      const stats = await window.flova.getFileStats(picked);
+      if (stats) {
+        setFileName(stats.name);
+        setFileSize(stats.size);
+      }
     }
   };
 
   const handleSend = async () => {
     if (!filePath || !window.flova) return;
     setIsSending(true);
-    // Start the transfer in the background
     window.flova.sendFile(filePath);
-    // Move to progress screen
     go("progress");
   };
 
@@ -59,7 +52,7 @@ export function SendScreen() {
         <h1 className="text-[20px] font-semibold tracking-tight text-ink">
           {fileName || "No file selected"}
         </h1>
-        {fileName && <p className="mt-1 text-[13px] text-ink-2">Ready to send</p>}
+        {fileName && <p className="mt-1 text-[13px] text-ink-2">{formatBytes(fileSize)}</p>}
       </div>
 
       {!fileName ? (
