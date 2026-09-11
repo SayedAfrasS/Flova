@@ -29,7 +29,7 @@ export type TransferMeta = { name: string; size: number; isSending: boolean }
 
 const PING_INTERVAL_MS = 3000
 const PONG_TIMEOUT_MS = 10000
-const CHUNK_SIZE = 1024 * 1024 // 1 MB segments
+const CHUNK_SIZE = 4 * 1024 * 1024 // 1 MB segments
 
 export class TransportServer {
   private wss: WebSocketServer

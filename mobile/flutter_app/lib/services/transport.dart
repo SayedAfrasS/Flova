@@ -47,7 +47,7 @@ class TransportClient {
   Timer? _pingTimer; Timer? _reconnectTimer;
   int _lastPongMs = 0; int _reconnectAttempt = 0;
 
-  static const int chunkSize = 1024 * 1024; // 1 MB segments
+  static const int chunkSize = 4 * 1024 * 1024; // 1 MB segments
 
   // receiving
   RandomAccessFile? _recvRaf;
