@@ -3,20 +3,22 @@
 /// 2. SENDING: after the laptop accepts, the file is read in 1 MB segments.
 ///    Each segment is wrapped in a binary frame:
 ///    [4-byte header length][header JSON {i, o, l}][segment bytes]
-///    The phone waits for a "chunk-ack" per segment (sequential transfer).
-/// 3. RECEIVING: on accept, a .part file is created and pre-allocated to the
-///    full size with RandomAccessFile.truncate. Incoming segments are written
-///    at their byte offset, so order does not matter.
+///    The phone registers the ack completer, SENDS the frame, then awaits the
+///    ack before the next segment (sequential transfer).
+/// 3. RECEIVING: on accept, a .part file is created and pre-allocated with
+///    truncate(). Incoming segments are written at their byte offset through
+///    a serialized write queue so writes can never interleave.
 /// 4. Every 25 segments a manifest sidecar is saved beside the .part file so
 ///    interrupted transfers can be resumed in a later phase.
 /// 5. On "file-end" the .part file is renamed to the final name (duplicates
-///    get _(1), _(2) suffixes) and the done event is emitted after flush/close.
+///    get _(1), _(2) suffixes) and the done event fires after close.
 ///
 /// FUNCTIONS:
-///  - sendFile()          : sends offer only; streaming starts after accept.
-///  - _streamPendingFile(): sequential segment loop with per-segment ack.
-///  - acceptIncomingFile(): pre-allocates .part, then replies file-accept.
-///  - _handleBinaryFrame(): parses header, writes at offset, sends chunk-ack.
+///  - sendFile()           : sends offer only; streaming starts after accept.
+///  - _streamPendingFile() : send-frame-then-await-ack loop over all segments.
+///  - acceptIncomingFile() : pre-allocates .part, then replies file-accept.
+///  - _handleBinaryFrame() : queues one serialized write for a segment.
+///  - _writeFrame()        : writes at offset, acks, reports progress.
 ///  - _finishIncomingFile(): closes, renames, removes sidecar, emits done.
 import 'dart:async';
 import 'dart:convert';
@@ -57,6 +59,7 @@ class TransportClient {
   final Set<int> _recvReceived = {};
   int _receivedBytes = 0;
   String? _pendingOfferName; int _pendingOfferSize = 0; String? _pendingOfferId;
+  Future<void> _writeQueue = Future<void>.value(); // serializes offset writes
 
   // sending
   File? _pendingSendFile;
@@ -122,11 +125,11 @@ class TransportClient {
         } else if (type == 'pong') {
           _lastPongMs = DateTime.now().millisecondsSinceEpoch;
         } else if (type == 'chunk-ack') {
-          final i = msg['i'] as int;
+          final i = (msg['i'] as num).toInt();
           _ackWaiters.remove(i)?.complete();
         } else if (type == 'file-offer') {
           _pendingOfferName = msg['name'] as String;
-          _pendingOfferSize = msg['size'] as int;
+          _pendingOfferSize = (msg['size'] as num).toInt();
           _pendingOfferId = (msg['transferId'] ?? 't0') as String;
           _fileEventCtrl.add(FileEvent(name: _pendingOfferName!, size: _pendingOfferSize, isOffer: true));
         } else if (type == 'file-accept') {
@@ -138,7 +141,7 @@ class TransportClient {
           _pendingSendFile = null;
           _sendStateCtrl.add(SendState.declined);
         } else if (type == 'file-start') {
-          // segments follow; sink already open from accept
+          // segments follow; the write sink is already open from accept
         } else if (type == 'file-end') {
           _finishIncomingFile();
         }
@@ -183,18 +186,18 @@ class TransportClient {
         await raf.setPosition(offset);
         final chunk = await raf.read(len);
 
-        // build binary frame: [4-byte header len][header json][payload]
         final headerBytes = utf8.encode(jsonEncode({'i': i, 'o': offset, 'l': chunk.length}));
         final bb = BytesBuilder();
         bb.add((ByteData(4)..setUint32(0, headerBytes.length)).buffer.asUint8List());
         bb.add(headerBytes);
         bb.add(chunk);
 
+        // 1) register completer, 2) SEND, 3) then wait for the ack
         final waiter = Completer<void>();
         _ackWaiters[i] = waiter;
         _channel!.sink.add(bb.toBytes());
-        await waiter.future; // sequential: next segment after this ack
-        if (_sendAborted) break;
+        await waiter.future;
+        if (_sendAborted || _channel == null) break;
         _sentBytes += chunk.length;
         _progressCtrl.add(chunk.length);
       }
@@ -220,7 +223,7 @@ class TransportClient {
     final safeName = _pendingOfferName!.split(Platform.pathSeparator).last;
     final partFile = File('${saveDir.path}/$safeName.part');
     final raf = await partFile.open(mode: FileMode.write);
-    await raf.truncate(_pendingOfferSize); // pre-allocate full size
+    await raf.truncate(_pendingOfferSize);
 
     _recvRaf = raf;
     _recvPartFile = partFile;
@@ -235,7 +238,12 @@ class TransportClient {
     _pendingOfferName = null; _pendingOfferSize = 0; _pendingOfferId = null;
   }
 
+  // queue every segment write so setPosition/writeFrom never interleave
   void _handleBinaryFrame(List<int> data) {
+    _writeQueue = _writeQueue.then((_) => _writeFrame(data));
+  }
+
+  Future<void> _writeFrame(List<int> data) async {
     final raf = _recvRaf;
     if (raf == null) return;
     try {
@@ -246,14 +254,14 @@ class TransportClient {
       final offset = (header['o'] as num).toInt();
       final index = (header['i'] as num).toInt();
 
-      // write segment at its exact byte offset (order independent)
-      raf.setPosition(offset).then((_) => raf.writeFrom(payload)).then((_) {
-        _recvReceived.add(index);
-        if (_recvReceived.length % 25 == 0) _writeSidecar();
-        _receivedBytes += payload.length;
-        _progressCtrl.add(payload.length);
-        _channel?.sink.add(jsonEncode({'type': 'chunk-ack', 'i': index}));
-      });
+      await raf.setPosition(offset);
+      await raf.writeFrom(payload);
+
+      _recvReceived.add(index);
+      if (_recvReceived.length % 25 == 0) _writeSidecar();
+      _receivedBytes += payload.length;
+      _progressCtrl.add(payload.length);
+      _channel?.sink.add(jsonEncode({'type': 'chunk-ack', 'i': index}));
     } catch (_) {}
   }
 
@@ -271,6 +279,8 @@ class TransportClient {
   Future<void> _finishIncomingFile() async {
     final raf = _recvRaf;
     if (raf != null) { try { await raf.close(); } catch (_) {} _recvRaf = null; }
+    // wait for queued writes to drain before renaming
+    await _writeQueue;
     final part = _recvPartFile; final dir = _recvSaveDir; final finalName = _recvFinalName;
     if (part == null || dir == null || finalName == null) return;
 
@@ -287,7 +297,7 @@ class TransportClient {
       final id = _recvTransferId;
       if (id != null) {
         final sidecar = File('${dir.path}/.$id.flova.json');
-        if (await sidecar.exists()) await sidecar.delete(); // complete: no resume needed
+        if (await sidecar.exists()) await sidecar.delete();
       }
       _fileEventCtrl.add(FileEvent(name: finalPath.split(Platform.pathSeparator).last, size: _recvSize, isDone: true));
     } catch (_) {}
@@ -296,11 +306,10 @@ class TransportClient {
 
   void _onClosed() {
     _stopTimers();
-    // abort in-flight send loop
     _sendAborted = true;
     for (final w in _ackWaiters.values) { if (!w.isCompleted) w.complete(); }
     _ackWaiters.clear();
-    _writeSidecar(); // keep manifest for a future resume phase
+    _writeSidecar();
     if (_host != null && _port != null) { _stateCtrl.add(TransportState.reconnecting); _scheduleReconnect(); }
     else _stateCtrl.add(TransportState.disconnected);
   }
