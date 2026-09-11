@@ -3,14 +3,8 @@
 /// 2. Handles the control protocol: hello, ping/pong, and file metadata.
 /// 3. When a file transfer starts, it opens a write stream to the app's documents folder.
 /// 4. Incoming binary frames are appended to the file stream.
-/// 5. Provides a sendFile method that reads a local file in 64KB chunks and
+/// 5. Provides a sendFile method that reads a local file in chunks and
 ///    sends them as binary frames to the peer.
-///
-/// CLASSES / FUNCTIONS:
-///  - TransportClient           : owns the channel, peer, and file streams.
-///  - TransportClient.sendFile  : reads a local file and streams it to the peer.
-///  - TransportClient.connect   : opens the socket and sends hello.
-///  - _onMessage                : handles control frames and binary chunks.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -34,7 +28,6 @@ class TransportClient {
   int _lastPongMs = 0;
   int _reconnectAttempt = 0;
 
-  // File transfer state
   IOSink? _fileSink;
   String? _currentFileName;
   int _currentFileSize = 0;
@@ -53,7 +46,6 @@ class TransportClient {
     Duration(seconds: 1), Duration(seconds: 2), Duration(seconds: 4),
     Duration(seconds: 8), Duration(seconds: 15),
   ];
-  static const int chunkSize = 64 * 1024; // 64 KB
 
   Future<void> connect({
     required String host, required int port,
@@ -88,7 +80,6 @@ class TransportClient {
 
   void _onMessage(dynamic data) {
     if (data is List<int>) {
-      // Incoming binary chunk
       if (_fileSink != null) {
         _fileSink!.add(data);
         _receivedBytes += data.length;
@@ -143,15 +134,9 @@ class TransportClient {
     _channel!.sink.add(jsonEncode({'type': 'file-start', 'name': name, 'size': size}));
     _sentBytes = 0;
 
+    // openRead() yields chunks (default 64KB) safely without memory spikes
     final stream = file.openRead();
     await for (final chunk in stream) {
-      // Backpressure: wait if buffer is too full
-      while ((_channel!.sink as WebSocketSink).closeCode == null && _channel!.sink is WebSocketSink) {
-         // Dart's web_socket_channel doesn't expose bufferedAmount easily,
-         // so we just add a tiny delay to prevent memory spikes on large files.
-         await Future.delayed(const Duration(milliseconds: 1));
-         break;
-      }
       _channel!.sink.add(chunk);
       _sentBytes += chunk.length;
       _progressCtrl.add(chunk.length);

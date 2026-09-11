@@ -3,14 +3,11 @@
 /// 2. Displays the selected file's name and size.
 /// 3. When "Send file" is clicked, it triggers the real file transfer via the TransportClient.
 /// 4. Navigates to the ProgressScreen to show real-time transfer stats.
-///
-/// CLASSES / FUNCTIONS:
-///  - SendScreen   : owns the selected file state and triggers the transfer.
-///  - _formatBytes : formats byte counts into human-readable strings (MB, GB).
 import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import '../core/tokens.dart';
+import '../core/transfer.dart';
 import '../services/transport.dart';
 import 'progress_screen.dart';
 

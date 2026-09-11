@@ -1,10 +1,16 @@
+/// WORKFLOW OF THIS FILE:
+/// 1. Displays a placeholder "Incoming file" UI for Phase 6.
+/// 2. In later phases, this will be triggered automatically when the laptop sends a file.
+/// 3. For now, tapping "Accept" simulates receiving a file by opening the Progress screen.
 import 'package:flutter/material.dart';
 import '../core/tokens.dart';
 import '../core/transfer.dart';
+import '../services/transport.dart';
 import 'progress_screen.dart';
 
 class ReceiveScreen extends StatelessWidget {
-  const ReceiveScreen({super.key});
+  final TransportClient transport;
+  const ReceiveScreen({super.key, required this.transport});
 
   static const info = TransferInfo(
     name: 'Beach Photos.zip',
@@ -39,8 +45,7 @@ class ReceiveScreen extends StatelessWidget {
                   child: Row(
                     children: [
                       Container(
-                        width: 44,
-                        height: 44,
+                        width: 44, height: 44,
                         decoration: BoxDecoration(
                           color: FlovaTokens.section,
                           borderRadius: BorderRadius.circular(FlovaTokens.rControl),
@@ -52,8 +57,7 @@ class ReceiveScreen extends StatelessWidget {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Text(info.name,
-                                style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: FlovaTokens.ink)),
+                            Text(info.name, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: FlovaTokens.ink)),
                             const SizedBox(height: 2),
                             Text(info.size, style: const TextStyle(fontSize: 12, color: FlovaTokens.ink3)),
                           ],
@@ -69,7 +73,7 @@ class ReceiveScreen extends StatelessWidget {
                   width: double.infinity,
                   child: FilledButton(
                     onPressed: () => Navigator.of(context).push(
-                      MaterialPageRoute(builder: (_) => ProgressScreen(info: info)),
+                      MaterialPageRoute(builder: (_) => ProgressScreen(info: info, transport: transport)),
                     ),
                     child: const Text('Accept'),
                   ),
