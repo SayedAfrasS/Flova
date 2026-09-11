@@ -1,12 +1,10 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. This is the root of the desktop UI.
- * 2. It reads the current screen name from the nav store (state/nav.ts).
- * 3. If not connected yet, it shows the QR connect screen alone.
- * 4. After connecting, it shows Sidebar + the current screen inside.
- * 5. The SCREENS map connects each screen name to its component.
+ * 1. Root of the desktop UI: picks the screen from the nav store.
+ * 2. Globally watches for incoming file offers: if one arrives while the user
+ *    is on Home, it jumps to the Receive screen automatically.
  */
-import type { ComponentType } from "react";
+import { useEffect, type ComponentType } from "react";
 import { useNav, type Screen } from "./state/nav";
 import { ConnectScreen } from "./screens/ConnectScreen";
 import { HomeScreen } from "./screens/HomeScreen";
@@ -34,6 +32,14 @@ const SCREENS: Record<Screen, ComponentType> = {
 export default function App() {
   const screen = useNav((s) => s.screen);
   const CurrentScreen = SCREENS[screen];
+
+  useEffect(() => {
+    const off = window.flova?.onIncomingOffer(() => {
+      const nav = useNav.getState();
+      if (nav.screen === "home") nav.go("receive");
+    });
+    return () => { off?.(); };
+  }, []);
 
   if (screen === "connect") return <ConnectScreen />;
 

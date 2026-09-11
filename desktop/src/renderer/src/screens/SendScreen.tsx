@@ -1,11 +1,11 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. Allows the user to pick a file from their laptop using the native OS dialog.
- * 2. Uses the file:getStats IPC call to read the real file name and size from disk.
- * 3. When "Send file" is clicked, it triggers the offerFile() handshake.
- * 4. Navigates to the ProgressScreen to show real-time transfer stats.
+ * 1. User picks a file; real name/size are read from disk via IPC.
+ * 2. "Send file" sends a file-offer and waits for the phone to accept.
+ * 3. On accept, navigates to the Progress screen (bytes start flowing then).
+ * 4. On decline, shows the decline state and re-enables the button.
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "../components/primitives";
 import { useNav } from "../state/nav";
 
@@ -20,26 +20,35 @@ export function SendScreen() {
   const [filePath, setFilePath] = useState<string | null>(null);
   const [fileName, setFileName] = useState("");
   const [fileSize, setFileSize] = useState(0);
-  const [isSending, setIsSending] = useState(false);
+  const [waiting, setWaiting] = useState(false);
+  const [declined, setDeclined] = useState(false);
+
+  useEffect(() => {
+    if (!window.flova) return;
+    const offAccepted = window.flova.onSendAccepted(() => go("progress"));
+    const offDeclined = window.flova.onSendDeclined(() => {
+      setWaiting(false);
+      setDeclined(true);
+    });
+    return () => { offAccepted(); offDeclined(); };
+  }, [go]);
 
   const handlePick = async () => {
     if (!window.flova) return;
     const picked = await window.flova.pickFile();
     if (picked) {
       setFilePath(picked);
+      setDeclined(false);
       const stats = await window.flova.getFileStats(picked);
-      if (stats) {
-        setFileName(stats.name);
-        setFileSize(stats.size);
-      }
+      if (stats) { setFileName(stats.name); setFileSize(stats.size); }
     }
   };
 
   const handleSend = async () => {
     if (!filePath || !window.flova) return;
-    setIsSending(true);
-    window.flova.sendFile(filePath);
-    go("progress");
+    setWaiting(true);
+    setDeclined(false);
+    await window.flova.sendFile(filePath);
   };
 
   return (
@@ -49,20 +58,22 @@ export function SendScreen() {
       </div>
 
       <div className="text-center">
-        <h1 className="text-[20px] font-semibold tracking-tight text-ink">
-          {fileName || "No file selected"}
-        </h1>
+        <h1 className="text-[20px] font-semibold tracking-tight text-ink">{fileName || "No file selected"}</h1>
         {fileName && <p className="mt-1 text-[13px] text-ink-2">{formatBytes(fileSize)}</p>}
       </div>
+
+      {declined && (
+        <p className="text-[13px] text-error">The phone declined this file.</p>
+      )}
 
       {!fileName ? (
         <Button onClick={handlePick} className="w-full">Browse files</Button>
       ) : (
         <div className="flex w-full flex-col gap-2">
-          <Button onClick={handleSend} disabled={isSending}>
-            {isSending ? "Starting..." : "Send file"}
+          <Button onClick={handleSend} disabled={waiting}>
+            {waiting ? "Waiting for phone to accept…" : "Send file"}
           </Button>
-          <Button variant="secondary" onClick={() => go("home")}>Cancel</Button>
+          <Button variant="secondary" onClick={() => go("home")} disabled={waiting}>Cancel</Button>
         </div>
       )}
     </div>
