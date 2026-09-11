@@ -1,7 +1,7 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. Tells TypeScript about the window.flova API added by the preload script.
- * 2. Without this file, every use of window.flova would be a type error.
+ * 1. Declares the TypeScript types for the window.flova API.
+ * 2. Ensures the renderer has strict type checking for IPC calls and events.
  */
 export {}
 
@@ -13,6 +13,11 @@ declare global {
       getPeerName: () => Promise<string | null>
       onPeerConnected: (cb: (name: string) => void) => () => void
       onPeerDisconnected: (cb: () => void) => () => void
+      
+      pickFile: () => Promise<string | null>
+      sendFile: (path: string) => Promise<boolean>
+      onFileProgress: (cb: (data: { bytes: number; isSending: boolean }) => void) => () => void
+      onFileDone: (cb: (data: { name: string; isSending: boolean }) => void) => () => void
     }
   }
 }

@@ -1,16 +1,12 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. Runs in a safe sandbox between the main process and the renderer.
- * 2. Exposes a tiny "flova" API to window.flova via contextBridge.
- * 3. The renderer uses this API to ask for server info and peer state.
- * 4. The renderer can also subscribe to peer-connected / peer-disconnected events.
+ * 1. Exposes a safe API to the renderer process via contextBridge.
+ * 2. Provides methods to query network state and pick/send files.
+ * 3. Provides subscription methods for real-time peer and file transfer events.
  *
  * FUNCTIONS:
- *  - getServer()        : returns { host, port } of the laptop's WS server.
- *  - getState()         : returns "waiting" or "paired".
- *  - getPeerName()      : returns the paired phone's name, or null.
- *  - onPeerConnected()  : registers a callback, returns unsubscribe function.
- *  - onPeerDisconnected() : same for disconnect events.
+ *  - Network methods: getServer, getState, getPeerName, onPeerConnected, onPeerDisconnected.
+ *  - File methods: pickFile, sendFile, onFileProgress, onFileDone.
  */
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 
@@ -29,6 +25,20 @@ const api = {
     ipcRenderer.on('net:peer-disconnected', listener)
     return () => ipcRenderer.removeListener('net:peer-disconnected', listener)
   },
+
+  pickFile: () => ipcRenderer.invoke('file:pick') as Promise<string | null>,
+  sendFile: (path: string) => ipcRenderer.invoke('file:send', path) as Promise<boolean>,
+  
+  onFileProgress: (cb: (data: { bytes: number; isSending: boolean }) => void) => {
+    const listener = (_e: IpcRendererEvent, data: { bytes: number; isSending: boolean }) => cb(data)
+    ipcRenderer.on('file:progress', listener)
+    return () => ipcRenderer.removeListener('file:progress', listener)
+  },
+  onFileDone: (cb: (data: { name: string; isSending: boolean }) => void) => {
+    const listener = (_e: IpcRendererEvent, data: { name: string; isSending: boolean }) => cb(data)
+    ipcRenderer.on('file:done', listener)
+    return () => ipcRenderer.removeListener('file:done', listener)
+  }
 }
 
 contextBridge.exposeInMainWorld('flova', api)
