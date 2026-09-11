@@ -8,12 +8,14 @@
 /// 6. While disconnected/error: same overlay but with "Reconnect" and "Go back".
 /// 7. On paired again, overlay fades out automatically.
 /// 8. Tab 0 = Home, Tab 1 = Transfers, Tab 2 = History, Tab 3 = Settings.
+/// 9. The Send button passes the live TransportClient to SendScreen so the
+///    selected file travels over the real socket connection.
 ///
 /// CLASSES / FUNCTIONS:
-///  - HomeScreen             : owns the transport client and the selected tab.
-///  - _buildHomeContent()    : builds the Home tab content.
-///  - _buildTransferItem()   : builds one row of the Recent transfers list.
-///  - _buildConnectionOverlay() : overlay shown when connection drops.
+///  - HomeScreen                : owns the transport client and the selected tab.
+///  - _buildHomeContent()       : builds the Home tab content.
+///  - _buildTransferItem()      : builds one row of the Recent transfers list.
+///  - _buildConnectionOverlay() : overlay shown when the connection drops.
 import 'dart:async';
 import 'package:flutter/material.dart';
 import '../core/flova_mark.dart';
@@ -42,6 +44,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    // watch the connection so the overlay can appear and disappear live
     _sub = widget.transport.stateStream.listen((s) {
       if (!mounted) return;
       setState(() => _state = s);
@@ -59,6 +62,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
 
+    // pick the body for the selected tab
     Widget bodyContent;
     switch (_selectedIndex) {
       case 0:
@@ -99,6 +103,7 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  // full-screen overlay shown while the connection is down
   Widget _buildConnectionOverlay() {
     final isReconnecting = _state == TransportState.reconnecting;
     return Container(
@@ -208,11 +213,14 @@ class _HomeScreenState extends State<HomeScreen> {
             Text(widget.peerName, style: textTheme.bodyLarge?.copyWith(color: FlovaTokens.ink2)),
           ]),
           const SizedBox(height: 32),
+          // SEND: passes the live transport client so the file uses the real socket
           SizedBox(
             width: double.infinity,
             child: FilledButton.icon(
               onPressed: isConnected
-                  ? () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SendScreen()))
+                  ? () => Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) => SendScreen(transport: widget.transport),
+                      ))
                   : null,
               icon: const Icon(Icons.send),
               label: const Text('Send a file'),
