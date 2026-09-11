@@ -1,8 +1,15 @@
 /// WORKFLOW OF THIS FILE:
-/// 1. Allows the user to pick a file from their phone using the file_picker package.
-/// 2. Displays the selected file's name and size.
-/// 3. When "Send file" is clicked, it triggers the real file transfer via the TransportClient.
-/// 4. Navigates to the ProgressScreen to show real-time transfer stats.
+/// 1. Lets the user pick one file from the phone using the file_picker package.
+/// 2. Uses the file_picker v12 static API: FilePicker.pickFile() returns a
+///    PlatformFile directly, or null when the user cancels the picker.
+/// 3. Shows the selected file's name and size on the confirmation card.
+/// 4. When "Send file" is tapped, hands the file to the TransportClient and
+///    opens the ProgressScreen to show live transfer stats.
+///
+/// FUNCTIONS:
+///  - _pickFile    : opens the native picker and stores the chosen file.
+///  - _sendFile    : starts the socket transfer and opens the progress screen.
+///  - _formatBytes : turns a byte count into a human readable string.
 import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -26,15 +33,29 @@ class _SendScreenState extends State<SendScreen> {
   bool _isSending = false;
 
   Future<void> _pickFile() async {
-    final result = await FilePicker.platform.pickFiles();
-    if (result != null && result.files.single.path != null) {
-      final file = File(result.files.single.path!);
-      setState(() {
-        _selectedFile = file;
-        _fileName = file.path.split('/').last.split('\\').last;
-        _fileSize = result.files.single.size;
-      });
+    // v12 API: static pickFile() for single selection, null on cancel
+    final picked = await FilePicker.pickFile();
+    if (picked == null) return; // user cancelled the picker
+
+    final path = picked.path;
+    if (path == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not open that file. Please pick another one.')),
+        );
+      }
+      return;
     }
+
+    final file = File(path);
+    // v12 removed the old .size property, so read the length from disk
+    final size = await file.length();
+
+    setState(() {
+      _selectedFile = file;
+      _fileName = picked.name;
+      _fileSize = size;
+    });
   }
 
   void _sendFile() {
@@ -62,8 +83,10 @@ class _SendScreenState extends State<SendScreen> {
     final text = Theme.of(context).textTheme;
     return Scaffold(
       appBar: AppBar(
-        backgroundColor: FlovaTokens.canvas, surfaceTintColor: Colors.transparent,
-        title: const Text('Send a file', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: FlovaTokens.ink)),
+        backgroundColor: FlovaTokens.canvas,
+        surfaceTintColor: Colors.transparent,
+        title: const Text('Send a file',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: FlovaTokens.ink)),
       ),
       body: SafeArea(
         child: Center(
@@ -73,27 +96,45 @@ class _SendScreenState extends State<SendScreen> {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Container(
-                  width: 80, height: 80,
-                  decoration: BoxDecoration(color: FlovaTokens.surface, border: Border.all(color: FlovaTokens.line), borderRadius: BorderRadius.circular(FlovaTokens.rCard)),
+                  width: 80,
+                  height: 80,
+                  decoration: BoxDecoration(
+                    color: FlovaTokens.surface,
+                    border: Border.all(color: FlovaTokens.line),
+                    borderRadius: BorderRadius.circular(FlovaTokens.rCard),
+                  ),
                   child: const Icon(Icons.description_outlined, size: 36, color: FlovaTokens.accent),
                 ),
                 const SizedBox(height: 16),
-                Text(_fileName.isEmpty ? 'No file selected' : _fileName, style: text.headlineMedium, textAlign: TextAlign.center),
+                Text(_fileName.isEmpty ? 'No file selected' : _fileName,
+                    style: text.headlineMedium, textAlign: TextAlign.center),
                 if (_fileName.isNotEmpty) ...[
                   const SizedBox(height: 4),
                   Text(_formatBytes(_fileSize), style: text.bodyMedium),
                 ],
                 const SizedBox(height: 24),
                 if (_fileName.isEmpty)
-                  SizedBox(width: double.infinity, child: FilledButton(onPressed: _pickFile, child: const Text('Browse files')))
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton(onPressed: _pickFile, child: const Text('Browse files')),
+                  )
                 else ...[
                   SizedBox(
                     width: double.infinity,
-                    child: FilledButton(onPressed: _isSending ? null : _sendFile, child: Text(_isSending ? 'Starting...' : 'Send file')),
+                    child: FilledButton(
+                      onPressed: _isSending ? null : _sendFile,
+                      child: Text(_isSending ? 'Starting...' : 'Send file'),
+                    ),
                   ),
                   const SizedBox(height: 12),
-                  SizedBox(width: double.infinity, child: OutlinedButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Cancel'))),
-                ]
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton(
+                      onPressed: () => Navigator.of(context).pop(),
+                      child: const Text('Cancel'),
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
