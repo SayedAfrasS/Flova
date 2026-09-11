@@ -1,10 +1,15 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. Displays the real-time progress of an active file transfer.
- * 2. On mount, reads the active transfer state via getCurrentTransfer() 
- *    so it knows the real file name and total bytes to track.
- * 3. Listens to IPC progress events to update the ring and speed dynamically.
- * 4. Automatically navigates to the CompleteScreen when the transfer finishes.
+ * 1. Shows live progress for the active transfer (sending or receiving).
+ * 2. On mount it reads the active transfer (name, size, direction) from main.
+ * 3. Bytes are accumulated in refs, and the speed math runs inside the IPC
+ *    event handler (the safe place for side effects in React), never inside
+ *    a state updater. Speed is refreshed at most twice per second.
+ * 4. Navigates to the Complete screen when main reports file-done.
+ *
+ * FUNCTIONS:
+ *  - formatBytes() : human readable byte strings.
+ *  - Ring()        : circular SVG progress indicator.
  */
 import { useEffect, useRef, useState } from "react";
 import { Button } from "../components/primitives";
@@ -41,15 +46,17 @@ export function ProgressScreen() {
   const [totalBytes, setTotalBytes] = useState(0);
   const [isSending, setIsSending] = useState(true);
   const [speed, setSpeed] = useState(0);
-  const lastUpdate = useRef(Date.now());
-  const lastBytes = useRef(0);
+
+  // refs hold the authoritative counters; state only mirrors them for rendering
+  const bytesRef = useRef(0);
+  const windowStartRef = useRef(Date.now());
+  const windowBytesRef = useRef(0);
 
   useEffect(() => {
     if (!window.flova) return;
     let cancelled = false;
 
-    // Read the active transfer state on mount
-    window.flova.getCurrentTransfer().then(t => {
+    window.flova.getCurrentTransfer().then((t) => {
       if (cancelled || !t) return;
       setFileName(t.name);
       setTotalBytes(t.size);
@@ -57,22 +64,28 @@ export function ProgressScreen() {
     });
 
     const offStart = window.flova.onFileTransferStart(({ name, size, isSending: sending }) => {
-      setFileName(name); setTotalBytes(size); setIsSending(sending);
+      bytesRef.current = 0;
+      windowStartRef.current = Date.now();
+      windowBytesRef.current = 0;
+      setTransferred(0);
+      setSpeed(0);
+      setFileName(name);
+      setTotalBytes(size);
+      setIsSending(sending);
     });
 
     const offProgress = window.flova.onFileProgress(({ bytes }) => {
+      // event handler = safe place for math and side effects
+      bytesRef.current += bytes;
       const now = Date.now();
-      const dt = (now - lastUpdate.current) / 1000;
-      
-      setTransferred(prev => {
-        const next = prev + bytes;
-        if (dt > 0.5) {
-          setSpeed((next - lastBytes.current) / dt);
-          lastUpdate.current = now;
-          lastBytes.current = next;
-        }
-        return next;
-      });
+      const dt = (now - windowStartRef.current) / 1000;
+      if (dt >= 0.5) {
+        const delta = bytesRef.current - windowBytesRef.current;
+        setSpeed(delta / dt);
+        windowStartRef.current = now;
+        windowBytesRef.current = bytesRef.current;
+      }
+      setTransferred(bytesRef.current);
     });
 
     const offDone = window.flova.onFileDone(() => {
