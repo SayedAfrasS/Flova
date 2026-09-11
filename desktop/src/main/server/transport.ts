@@ -2,9 +2,10 @@
  * WORKFLOW OF THIS FILE:
  * 1. Manages the WebSocket server and the active peer connection.
  * 2. Handles the handshake protocol: offer -> accept -> stream -> end.
- * 3. offerFile() sends metadata to the peer and waits for them to say "accept".
- * 4. When "file-accept" is received, it opens the file stream and sends chunks.
- * 5. Handles incoming files from the peer by writing binary chunks to disk.
+ * 3. Tracks the "currentTransfer" state so the UI can read the real file name and size.
+ * 4. offerFile() sends metadata to the peer and waits for them to say "accept".
+ * 5. When "file-accept" is received, it opens the file stream and sends chunks.
+ * 6. Handles incoming files from the peer by writing binary chunks to disk.
  */
 import { WebSocketServer, WebSocket } from 'ws'
 import { app } from 'electron'
@@ -34,9 +35,12 @@ export class TransportServer {
   // File sending state (handshake)
   private pendingFilePath: string | null = null
 
+  // Shared state for the UI
+  private currentTransfer: { name: string; size: number; isSending: boolean } | null = null
+
   onPeerConnected?: (peer: Peer) => void
   onPeerDisconnected?: () => void
-  onFileIncoming?: (name: string, size: number) => void
+  onFileTransferStart?: (name: string, size: number, isSending: boolean) => void
   onFileProgress?: (bytes: number, isSending: boolean) => void
   onFileDone?: (name: string, isSending: boolean) => void
 
@@ -71,7 +75,6 @@ export class TransportServer {
           } else if (msg?.type === 'ping') { ws.send(JSON.stringify({ type: 'pong' })); } 
           else if (msg?.type === 'pong') { this.lastPong = Date.now(); } 
           else if (msg?.type === 'file-accept') {
-            // Peer is ready, start streaming the pending file
             if (this.pendingFilePath) {
               this.startFileStream(this.pendingFilePath);
               this.pendingFilePath = null;
@@ -90,6 +93,7 @@ export class TransportServer {
         this.stopHb(); this.peerWs = null; this.peer = null;
         if (this.writeStream) this.writeStream.close();
         this.writeStream = null;
+        this.currentTransfer = null;
         this.onPeerDisconnected?.();
       }
     })
@@ -102,8 +106,11 @@ export class TransportServer {
     this.pendingFilePath = filePath;
     const stats = fs.statSync(filePath);
     const name = path.basename(filePath);
-    this.peerWs.send(JSON.stringify({ type: 'file-offer', name, size: stats.size }));
-    this.onFileIncoming?.(name, stats.size);
+    const size = stats.size;
+    
+    this.currentTransfer = { name, size, isSending: true };
+    this.peerWs.send(JSON.stringify({ type: 'file-offer', name, size }));
+    this.onFileTransferStart?.(name, size, true);
   }
 
   // Step 3: Stream chunks after peer accepts
@@ -111,8 +118,9 @@ export class TransportServer {
     if (!this.peerWs) return;
     const stats = fs.statSync(filePath);
     const name = path.basename(filePath);
+    const size = stats.size;
     
-    this.peerWs.send(JSON.stringify({ type: 'file-start', name, size: stats.size }));
+    this.peerWs.send(JSON.stringify({ type: 'file-start', name, size }));
     const rs = fs.createReadStream(filePath, { highWaterMark: CHUNK_SIZE });
     
     for await (const chunk of rs) {
@@ -125,6 +133,7 @@ export class TransportServer {
     
     this.peerWs.send(JSON.stringify({ type: 'file-end' }));
     this.onFileDone?.(name, true);
+    this.currentTransfer = null;
   }
 
   private handleIncomingFile(name: string, size: number): void {
@@ -137,6 +146,9 @@ export class TransportServer {
     this.currentFileSize = size;
     this.receivedBytes = 0;
     this.writeStream = fs.createWriteStream(savePath);
+    
+    this.currentTransfer = { name: safeName, size, isSending: false };
+    this.onFileTransferStart?.(safeName, size, false);
   }
 
   private finishIncomingFile(): void {
@@ -145,9 +157,12 @@ export class TransportServer {
         if (this.currentFileName) this.onFileDone?.(this.currentFileName, false);
         this.writeStream = null;
         this.currentFileName = null;
+        this.currentTransfer = null;
       });
     }
   }
+
+  getCurrentTransfer() { return this.currentTransfer; }
 
   private startHb(): void {
     this.stopHb();

@@ -15,7 +15,10 @@ declare global {
       onPeerDisconnected: (cb: () => void) => () => void
       
       pickFile: () => Promise<string | null>
+      getFileStats: (path: string) => Promise<{ name: string; size: number } | null>
       sendFile: (path: string) => Promise<boolean>
+      getCurrentTransfer: () => Promise<{ name: string; size: number; isSending: boolean } | null>
+      onFileTransferStart: (cb: (data: { name: string; size: number; isSending: boolean }) => void) => () => void
       onFileProgress: (cb: (data: { bytes: number; isSending: boolean }) => void) => () => void
       onFileDone: (cb: (data: { name: string; isSending: boolean }) => void) => () => void
     }

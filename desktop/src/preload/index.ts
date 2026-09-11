@@ -1,12 +1,8 @@
 /**
  * WORKFLOW OF THIS FILE:
  * 1. Exposes a safe API to the renderer process via contextBridge.
- * 2. Provides methods to query network state and pick/send files.
+ * 2. Provides methods to query network state, pick files, and read file stats.
  * 3. Provides subscription methods for real-time peer and file transfer events.
- *
- * FUNCTIONS:
- *  - Network methods: getServer, getState, getPeerName, onPeerConnected, onPeerDisconnected.
- *  - File methods: pickFile, sendFile, onFileProgress, onFileDone.
  */
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 
@@ -27,8 +23,15 @@ const api = {
   },
 
   pickFile: () => ipcRenderer.invoke('file:pick') as Promise<string | null>,
+  getFileStats: (path: string) => ipcRenderer.invoke('file:getStats', path) as Promise<{ name: string; size: number } | null>,
   sendFile: (path: string) => ipcRenderer.invoke('file:send', path) as Promise<boolean>,
+  getCurrentTransfer: () => ipcRenderer.invoke('file:getCurrentTransfer') as Promise<{ name: string; size: number; isSending: boolean } | null>,
   
+  onFileTransferStart: (cb: (data: { name: string; size: number; isSending: boolean }) => void) => {
+    const listener = (_e: IpcRendererEvent, data: { name: string; size: number; isSending: boolean }) => cb(data)
+    ipcRenderer.on('file:transfer-start', listener)
+    return () => ipcRenderer.removeListener('file:transfer-start', listener)
+  },
   onFileProgress: (cb: (data: { bytes: number; isSending: boolean }) => void) => {
     const listener = (_e: IpcRendererEvent, data: { bytes: number; isSending: boolean }) => cb(data)
     ipcRenderer.on('file:progress', listener)
