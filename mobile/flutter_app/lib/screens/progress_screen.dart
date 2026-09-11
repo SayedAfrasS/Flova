@@ -1,8 +1,11 @@
 /// WORKFLOW OF THIS FILE:
-/// 1. Displays real-time progress for sending or receiving a file.
-/// 2. When SENDING: Navigates to Complete screen when network bytes reach 100%.
-/// 3. When RECEIVING: Waits for the transport's fileEventStream "isDone" event.
-///    This ensures the file is fully flushed to disk before showing the success screen.
+/// 1. Shows live transfer progress with a centered ring and centered stats.
+/// 2. On mount it seeds the transferred counter from the transport's real
+///    byte counters, so the screen can never sit idle at 0% if a few
+///    progress events fired before the screen opened.
+/// 3. Sending: completes when transferred bytes reach the file size.
+/// 4. Receiving: completes only on the transport's isDone event, which fires
+///    after the file is fully flushed and closed on disk.
 import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
@@ -25,22 +28,25 @@ class _ProgressScreenState extends State<ProgressScreen> {
   double _speed = 0;
   int _lastUpdateMs = 0;
   double _lastBytes = 0;
-
+  bool _isDone = false;
   StreamSubscription<int>? _sub;
   StreamSubscription<FileEvent>? _fileSub;
-  bool _isDone = false;
 
   @override
   void initState() {
     super.initState();
     _lastUpdateMs = DateTime.now().millisecondsSinceEpoch;
 
-    // Listen to network progress for the UI ring
+    // seed from real counters so late mounts never show a stuck 0%
+    _transferred = widget.info.sending
+        ? widget.transport.sentBytes.toDouble()
+        : widget.transport.receivedBytes.toDouble();
+    _lastBytes = _transferred;
+
     _sub = widget.transport.progressStream.listen((bytes) {
       if (_isDone) return;
       final now = DateTime.now().millisecondsSinceEpoch;
       final dt = (now - _lastUpdateMs) / 1000.0;
-
       setState(() {
         _transferred += bytes;
         if (dt > 0.5) {
@@ -49,43 +55,30 @@ class _ProgressScreenState extends State<ProgressScreen> {
           _lastBytes = _transferred;
         }
       });
-
-      // If SENDING, complete when bytes match
-      if (widget.info.sending && _transferred >= widget.info.bytes && !_isDone) {
-        _isDone = true;
-        Future.delayed(const Duration(milliseconds: 500), () {
-          if (mounted) {
-            Navigator.of(context).pushReplacement(
-              MaterialPageRoute(builder: (_) => CompleteScreen(info: widget.info)),
-            );
-          }
-        });
-      }
+      if (widget.info.sending && _transferred >= widget.info.bytes) _complete();
     });
 
-    // If RECEIVING, wait for the actual disk write to finish
     if (!widget.info.sending) {
       _fileSub = widget.transport.fileEventStream.listen((event) {
-        if (event.isDone && !_isDone) {
-          _isDone = true;
-          Future.delayed(const Duration(milliseconds: 500), () {
-            if (mounted) {
-              Navigator.of(context).pushReplacement(
-                MaterialPageRoute(builder: (_) => CompleteScreen(info: widget.info)),
-              );
-            }
-          });
-        }
+        if (event.isDone) _complete();
       });
     }
   }
 
-  @override
-  void dispose() {
-    _sub?.cancel();
-    _fileSub?.cancel();
-    super.dispose();
+  void _complete() {
+    if (_isDone) return;
+    _isDone = true;
+    Future.delayed(const Duration(milliseconds: 500), () {
+      if (mounted) {
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(builder: (_) => CompleteScreen(info: widget.info)),
+        );
+      }
+    });
   }
+
+  @override
+  void dispose() { _sub?.cancel(); _fileSub?.cancel(); super.dispose(); }
 
   String _formatBytes(double bytes) {
     if (bytes >= 1024 * 1024 * 1024) return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
@@ -106,33 +99,44 @@ class _ProgressScreenState extends State<ProgressScreen> {
             style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: FlovaTokens.ink)),
       ),
       body: SafeArea(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Icon(Icons.description_outlined, size: 40, color: FlovaTokens.accent),
-            const SizedBox(height: 8),
-            Text(widget.info.name, style: text.headlineMedium, textAlign: TextAlign.center),
-            const SizedBox(height: 32),
-            SizedBox(
-              width: 200, height: 200,
-              child: Stack(
-                alignment: Alignment.center,
-                children: [
-                  CustomPaint(size: const Size(200, 200), painter: _RingPainter(pct)),
-                  Text('${(pct * 100).round()}%',
-                      style: const TextStyle(fontSize: 36, fontWeight: FontWeight.w600, color: FlovaTokens.ink)),
-                ],
-              ),
+        child: Center(
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                const Icon(Icons.description_outlined, size: 40, color: FlovaTokens.accent),
+                const SizedBox(height: 8),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 32),
+                  child: Text(widget.info.name, style: text.headlineMedium, textAlign: TextAlign.center),
+                ),
+                const SizedBox(height: 32),
+                Center(
+                  child: SizedBox(
+                    width: 200, height: 200,
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        CustomPaint(size: const Size(200, 200), painter: _RingPainter(pct)),
+                        Text('${(pct * 100).round()}%',
+                            style: const TextStyle(fontSize: 36, fontWeight: FontWeight.w600, color: FlovaTokens.ink)),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 24),
+                Text('${_formatBytes(_transferred)} of ${_formatBytes(widget.info.bytes)}',
+                    style: text.bodyLarge?.copyWith(color: FlovaTokens.ink), textAlign: TextAlign.center),
+                const SizedBox(height: 4),
+                Text(_speed > 0 ? '${_formatBytes(_speed)}/s' : 'Calculating speed…',
+                    style: text.bodyMedium, textAlign: TextAlign.center),
+                const SizedBox(height: 2),
+                Text(_speed > 0 ? 'About $secondsLeft seconds left' : '',
+                    style: text.bodyMedium?.copyWith(color: FlovaTokens.ink3), textAlign: TextAlign.center),
+              ],
             ),
-            const SizedBox(height: 24),
-            Text('${_formatBytes(_transferred)} transferred',
-                style: text.bodyLarge?.copyWith(color: FlovaTokens.ink)),
-            const SizedBox(height: 4),
-            Text(_speed > 0 ? '${_formatBytes(_speed)}/s' : 'Calculating speed...', style: text.bodyMedium),
-            const SizedBox(height: 2),
-            Text(_speed > 0 ? 'About $secondsLeft seconds left' : '',
-                style: text.bodyMedium?.copyWith(color: FlovaTokens.ink3)),
-          ],
+          ),
         ),
       ),
     );
