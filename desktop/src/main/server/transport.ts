@@ -1,24 +1,22 @@
 /**
  * WORKFLOW OF THIS FILE:
  * 1. Owns the WebSocket server, the peer, and the offer/accept handshake.
- * 2. SENDING: after accept, the file is read in 1 MB segments.
- *    Each segment is wrapped in a binary frame:
- *    [4-byte header length][header JSON {i, o, l}][segment bytes]
- *    The sender waits for a "chunk-ack" for each segment before sending the next
- *    (sequential transfer; parallel workers arrive in Phase 9).
+ * 2. SENDING: after accept, the file is read in 1 MB segments. Each segment is
+ *    wrapped in a binary frame: [4-byte header length][header JSON][bytes].
+ *    ORDER MATTERS: register the ack promise, SEND the frame, then await the
+ *    ack before moving to the next segment (sequential transfer).
  * 3. RECEIVING: on accept, a .part file is created and pre-allocated to the
- *    full size. Each incoming segment is written at its byte offset, so
- *    segments may arrive in any order now or later.
- * 4. Every 25 segments a small manifest sidecar is saved next to the .part
- *    file so interrupted transfers can be resumed in a later phase.
- * 5. When "file-end" arrives the .part file is renamed to its final name
- *    (duplicate names get a _(1), _(2) suffix) and the UI is notified.
+ *    full size. Each incoming segment is written at its byte offset.
+ * 4. Every 25 segments a manifest sidecar is saved beside the .part file so
+ *    interrupted transfers can be resumed in a later phase.
+ * 5. On "file-end" the .part file is renamed to its final name (duplicates
+ *    get _(1), _(2) suffixes) and the UI is notified.
  *
  * FUNCTIONS:
- *  - offerFile()        : sends metadata + segment plan, waits for accept.
- *  - startFileStream()  : sequential segment loop with per-segment ack.
- *  - acceptIncoming()   : pre-allocates .part file, then replies file-accept.
- *  - handleBinaryFrame(): parses header, writes segment at offset, sends ack.
+ *  - offerFile()         : sends metadata + segment plan, waits for accept.
+ *  - startFileStream()   : send-frame-then-await-ack loop over all segments.
+ *  - acceptIncoming()    : pre-allocates .part file, then replies file-accept.
+ *  - handleBinaryFrame() : parses header, writes segment at offset, sends ack.
  *  - finishIncomingFile(): closes, renames, cleans sidecar, notifies UI.
  */
 import { WebSocketServer, WebSocket } from 'ws'
@@ -117,7 +115,7 @@ export class TransportServer {
           this.currentTransfer = null
           this.onSendDeclined?.()
         } else if (msg?.type === 'file-start') {
-          // segments follow; sink already open from accept
+          // segments follow; the write sink is already open from accept
         } else if (msg?.type === 'file-end') {
           this.finishIncomingFile()
         }
@@ -129,12 +127,11 @@ export class TransportServer {
     ws.on('close', () => {
       if (this.peerWs === ws) {
         this.stopHb(); this.peerWs = null; this.peer = null
-        // abort any in-flight send loop
         this.sendAborted = true
         for (const resolve of this.ackResolvers.values()) resolve()
         this.ackResolvers.clear()
         if (this.recvFd != null) { try { fs.closeSync(this.recvFd) } catch {} this.recvFd = null }
-        this.writeSidecar() // keep manifest so a future phase can resume
+        this.writeSidecar()
         this.currentTransfer = null
         this.onPeerDisconnected?.()
       }
@@ -183,12 +180,11 @@ export class TransportServer {
         const prefix = Buffer.alloc(4)
         prefix.writeUInt32BE(header.length, 0)
 
-        // wait for this segment's ack before sending the next (sequential)
-        await new Promise<void>((resolve) => { this.ackResolvers.set(i, resolve) })
-        if (this.sendAborted || !this.peerWs) break
+        // 1) register the ack promise, 2) SEND, 3) then wait for the ack
+        const ackPromise = new Promise<void>((resolve) => { this.ackResolvers.set(i, resolve) })
         this.peerWs.send(Buffer.concat([prefix, header, buf]))
-        await new Promise<void>((resolve) => { this.ackResolvers.set(i, resolve) })
-        if (this.sendAborted) break
+        await ackPromise
+        if (this.sendAborted || !this.peerWs) break
         this.onFileProgress?.(len, true)
       }
     } finally {
@@ -217,7 +213,7 @@ export class TransportServer {
 
     const partPath = path.join(saveDir, `${name}.part`)
     this.recvFd = fs.openSync(partPath, 'w')
-    fs.ftruncateSync(this.recvFd, size) // pre-allocate full size
+    fs.ftruncateSync(this.recvFd, size)
     this.recvPartPath = partPath
     this.recvFinalName = name
     this.recvSize = size
@@ -244,7 +240,7 @@ export class TransportServer {
       const headerLen = data.readUInt32BE(0)
       const header = JSON.parse(data.subarray(4, 4 + headerLen).toString('utf8'))
       const payload = data.subarray(4 + headerLen)
-      fs.writeSync(this.recvFd, payload, 0, payload.length, Number(header.o)) // offset write
+      fs.writeSync(this.recvFd, payload, 0, payload.length, Number(header.o))
       this.recvReceived.add(Number(header.i))
       if (this.recvReceived.size % 25 === 0) this.writeSidecar()
       this.peerWs?.send(JSON.stringify({ type: 'chunk-ack', i: header.i }))
@@ -281,7 +277,7 @@ export class TransportServer {
       fs.renameSync(this.recvPartPath, finalPath)
       if (this.recvSaveDir && this.recvTransferId) {
         const sidecar = path.join(this.recvSaveDir, `.${this.recvTransferId}.flova.json`)
-        if (fs.existsSync(sidecar)) fs.unlinkSync(sidecar) // complete: no resume needed
+        if (fs.existsSync(sidecar)) fs.unlinkSync(sidecar)
       }
       this.onFileDone?.(path.basename(finalPath), false)
     } catch (err) {
