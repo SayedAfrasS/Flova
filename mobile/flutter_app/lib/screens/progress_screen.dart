@@ -1,13 +1,8 @@
 /// WORKFLOW OF THIS FILE:
-/// 1. Displays the real-time progress of an active file transfer.
-/// 2. Subscribes to the TransportClient's progress stream to get real byte counts.
-/// 3. Calculates percentage, speed, and estimated time remaining based on real data.
-/// 4. Automatically navigates to the CompleteScreen when the transfer finishes.
-///
-/// CLASSES / FUNCTIONS:
-///  - ProgressScreen : owns the progress state and stream subscriptions.
-///  - _formatBytes   : formats byte counts into human-readable strings.
-///  - _RingPainter   : draws the circular progress indicator.
+/// 1. Displays real-time progress for sending or receiving a file.
+/// 2. When SENDING: Navigates to Complete screen when network bytes reach 100%.
+/// 3. When RECEIVING: Waits for the transport's fileEventStream "isDone" event.
+///    This ensures the file is fully flushed to disk before showing the success screen.
 import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
@@ -30,13 +25,17 @@ class _ProgressScreenState extends State<ProgressScreen> {
   double _speed = 0;
   int _lastUpdateMs = 0;
   double _lastBytes = 0;
+
   StreamSubscription<int>? _sub;
+  StreamSubscription<FileEvent>? _fileSub;
   bool _isDone = false;
 
   @override
   void initState() {
     super.initState();
     _lastUpdateMs = DateTime.now().millisecondsSinceEpoch;
+
+    // Listen to network progress for the UI ring
     _sub = widget.transport.progressStream.listen((bytes) {
       if (_isDone) return;
       final now = DateTime.now().millisecondsSinceEpoch;
@@ -51,7 +50,8 @@ class _ProgressScreenState extends State<ProgressScreen> {
         }
       });
 
-      if (_transferred >= widget.info.bytes && !_isDone) {
+      // If SENDING, complete when bytes match
+      if (widget.info.sending && _transferred >= widget.info.bytes && !_isDone) {
         _isDone = true;
         Future.delayed(const Duration(milliseconds: 500), () {
           if (mounted) {
@@ -62,11 +62,28 @@ class _ProgressScreenState extends State<ProgressScreen> {
         });
       }
     });
+
+    // If RECEIVING, wait for the actual disk write to finish
+    if (!widget.info.sending) {
+      _fileSub = widget.transport.fileEventStream.listen((event) {
+        if (event.isDone && !_isDone) {
+          _isDone = true;
+          Future.delayed(const Duration(milliseconds: 500), () {
+            if (mounted) {
+              Navigator.of(context).pushReplacement(
+                MaterialPageRoute(builder: (_) => CompleteScreen(info: widget.info)),
+              );
+            }
+          });
+        }
+      });
+    }
   }
 
   @override
   void dispose() {
     _sub?.cancel();
+    _fileSub?.cancel();
     super.dispose();
   }
 

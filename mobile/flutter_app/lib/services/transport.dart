@@ -1,8 +1,9 @@
 /// WORKFLOW OF THIS FILE:
 /// 1. Manages the WebSocket connection and the offer/accept handshake.
-/// 2. When a file-offer arrives, it emits an event to the UI.
-/// 3. When the user accepts, it opens the file sink FIRST, then sends file-accept.
-/// 4. This guarantees the sink is ready before the desktop sends binary chunks.
+/// 2. When accepting a file, it saves to the external storage directory on Android
+///    so the file is visible in standard file manager apps.
+/// 3. Properly awaits the file sink flush and close before emitting the "done" event,
+///    ensuring the file is fully written to disk before the UI updates.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -87,26 +88,45 @@ class TransportClient {
           _pendingOfferName = msg['name'] as String;
           _pendingOfferSize = msg['size'] as int;
           _fileEventCtrl.add(FileEvent(name: _pendingOfferName!, size: _pendingOfferSize!, isOffer: true));
-        } else if (type == 'file-end') { _finishIncomingFile(); }
+        } else if (type == 'file-end') {
+          _finishIncomingFile();
+        }
       } catch (_) {}
     }
   }
 
-  // Called by the UI when the user taps "Accept"
   Future<void> acceptIncomingFile() async {
     if (_pendingOfferName == null) return;
 
-    final dir = await getApplicationDocumentsDirectory();
-    final saveDir = Directory('${dir.path}/Flova');
+    // Use external storage on Android so it's visible in file managers
+    Directory? baseDir;
+    if (Platform.isAndroid) {
+      baseDir = await getExternalStorageDirectory();
+    }
+    baseDir ??= await getApplicationDocumentsDirectory();
+
+    final saveDir = Directory('${baseDir.path}/Flova');
     if (!await saveDir.exists()) await saveDir.create(recursive: true);
 
     final safeName = _pendingOfferName!.split(Platform.pathSeparator).last;
-    final file = File('${saveDir.path}/$safeName');
-    _fileSink = file.openWrite(); // Open sink BEFORE telling desktop to send
-    _currentFileName = safeName; _currentFilePath = file.path;
-    _currentFileSize = _pendingOfferSize!; _receivedBytes = 0;
+    var file = File('${saveDir.path}/$safeName');
 
-    _channel?.sink.add(jsonEncode({'type': 'file-accept'})); // Tell desktop to start streaming
+    // Handle duplicate filenames
+    int counter = 1;
+    while (await file.exists()) {
+      final ext = safeName.contains('.') ? '.${safeName.split('.').last}' : '';
+      final nameWithoutExt = safeName.contains('.') ? safeName.substring(0, safeName.lastIndexOf('.')) : safeName;
+      file = File('${saveDir.path}/${nameWithoutExt}_($counter)$ext');
+      counter++;
+    }
+
+    _fileSink = file.openWrite();
+    _currentFileName = file.path.split(Platform.pathSeparator).last;
+    _currentFilePath = file.path;
+    _currentFileSize = _pendingOfferSize!;
+    _receivedBytes = 0;
+
+    _channel?.sink.add(jsonEncode({'type': 'file-accept'}));
     _pendingOfferName = null; _pendingOfferSize = 0;
   }
 
@@ -120,10 +140,23 @@ class TransportClient {
     _channel!.sink.add(jsonEncode({'type': 'file-end'}));
   }
 
-  void _finishIncomingFile() {
+  // CRITICAL FIX: Await flush and close so the file is actually on disk before emitting done
+  Future<void> _finishIncomingFile() async {
     final name = _currentFileName;
-    _fileSink?.flush(); _fileSink?.close(); _fileSink = null;
-    if (name != null) _fileEventCtrl.add(FileEvent(name: name, size: _currentFileSize, isDone: true));
+    if (_fileSink != null) {
+      try {
+        await _fileSink!.flush();
+        await _fileSink!.close();
+      } catch (e) {
+        print('[transport] error closing file sink: $e');
+      }
+    }
+    _fileSink = null;
+
+    if (name != null) {
+      _fileEventCtrl.add(FileEvent(name: name, size: _currentFileSize, isDone: true));
+    }
+
     _currentFileName = null; _currentFilePath = null;
   }
 
