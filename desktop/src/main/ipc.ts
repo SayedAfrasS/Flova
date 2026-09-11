@@ -1,56 +1,50 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. Registers IPC handlers for the renderer process.
- * 2. file:getStats reads the real file size of a picked file from the disk.
- * 3. file:getCurrentTransfer lets the UI read the active transfer state on mount.
+ * 1. Bridges the TransportServer events to the renderer via IPC.
+ * 2. Exposes accept/decline handlers so the Receive screen controls the handshake.
+ * 3. Exposes send-accepted / send-declined so the Send screen can wait properly.
  */
 import { ipcMain, BrowserWindow, dialog } from 'electron'
 import * as fs from 'fs'
 import * as path from 'path'
-import { TransportServer, type Peer } from './server/transport'
+import { TransportServer, type Peer, type TransferMeta } from './server/transport'
 
 export function registerIpc(server: TransportServer, getInfo: () => { host: string; port: number }): void {
   let peer: Peer | null = null
-
-  server.onPeerConnected = (p) => { peer = p; for (const win of BrowserWindow.getAllWindows()) win.webContents.send('net:peer-connected', p.name); }
-  server.onPeerDisconnected = () => { peer = null; for (const win of BrowserWindow.getAllWindows()) win.webContents.send('net:peer-disconnected'); }
-  
-  server.onFileTransferStart = (name, size, isSending) => { 
-    for (const win of BrowserWindow.getAllWindows()) win.webContents.send('file:transfer-start', { name, size, isSending }); 
-  }
-  server.onFileProgress = (bytes, isSending) => { 
-    for (const win of BrowserWindow.getAllWindows()) win.webContents.send('file:progress', { bytes, isSending }); 
-  }
-  server.onFileDone = (name, isSending) => { 
-    for (const win of BrowserWindow.getAllWindows()) win.webContents.send('file:done', { name, isSending }); 
+  const broadcast = (channel: string, payload?: unknown) => {
+    for (const win of BrowserWindow.getAllWindows()) win.webContents.send(channel, payload)
   }
 
-  ipcMain.handle('net:getServer', () => getInfo());
-  ipcMain.handle('net:getState', () => (peer ? 'paired' : 'waiting'));
-  ipcMain.handle('net:getPeerName', () => peer?.name ?? null);
+  server.onPeerConnected = (p) => { peer = p; broadcast('net:peer-connected', p.name) }
+  server.onPeerDisconnected = () => { peer = null; broadcast('net:peer-disconnected') }
+  server.onIncomingOffer = (name, size) => broadcast('file:incoming-offer', { name, size })
+  server.onSendAccepted = () => broadcast('file:send-accepted')
+  server.onSendDeclined = () => broadcast('file:send-declined')
+  server.onFileTransferStart = (meta) => broadcast('file:transfer-start', meta)
+  server.onFileProgress = (bytes, isSending) => broadcast('file:progress', { bytes, isSending })
+  server.onFileDone = (name, isSending) => broadcast('file:done', { name, isSending })
+
+  ipcMain.handle('net:getServer', () => getInfo())
+  ipcMain.handle('net:getState', () => (peer ? 'paired' : 'waiting'))
+  ipcMain.handle('net:getPeerName', () => peer?.name ?? null)
 
   ipcMain.handle('file:pick', async () => {
-    const result = await dialog.showOpenDialog({ properties: ['openFile'] });
-    if (result.canceled || result.filePaths.length === 0) return null;
-    return result.filePaths[0];
-  });
-
+    const result = await dialog.showOpenDialog({ properties: ['openFile'] })
+    if (result.canceled || result.filePaths.length === 0) return null
+    return result.filePaths[0]
+  })
   ipcMain.handle('file:getStats', (_, filePath: string) => {
     try {
-      const stats = fs.statSync(filePath);
-      return { name: path.basename(filePath), size: stats.size };
-    } catch { return null; }
-  });
-
-  ipcMain.handle('file:getCurrentTransfer', () => server.getCurrentTransfer());
-
+      const stats = fs.statSync(filePath)
+      return { name: path.basename(filePath), size: stats.size }
+    } catch { return null }
+  })
   ipcMain.handle('file:send', async (_, filePath: string) => {
-    try {
-      server.offerFile(filePath); 
-      return true;
-    } catch (err) {
-      console.error('[ipc] file send failed', err);
-      return false;
-    }
-  });
+    try { server.offerFile(filePath); return true } catch (err) { console.error('[ipc] offer failed', err); return false }
+  })
+  ipcMain.handle('file:getIncomingOffer', () => server.getIncomingOffer())
+  ipcMain.handle('file:acceptIncoming', () => { server.acceptIncoming(); return true })
+  ipcMain.handle('file:declineIncoming', () => { server.declineIncoming(); return true })
+  ipcMain.handle('file:getCurrentTransfer', () => server.getCurrentTransfer())
+  ipcMain.handle('file:getLastTransfer', () => server.getLastTransfer())
 }

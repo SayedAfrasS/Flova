@@ -1,7 +1,6 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. Declares the TypeScript types for the window.flova API.
- * 2. Ensures the renderer has strict type checking for IPC calls and events.
+ * 1. Declares the window.flova API types for strict renderer type checking.
  */
 export {}
 
@@ -13,14 +12,23 @@ declare global {
       getPeerName: () => Promise<string | null>
       onPeerConnected: (cb: (name: string) => void) => () => void
       onPeerDisconnected: (cb: () => void) => () => void
-      
+
       pickFile: () => Promise<string | null>
       getFileStats: (path: string) => Promise<{ name: string; size: number } | null>
       sendFile: (path: string) => Promise<boolean>
+      onSendAccepted: (cb: () => void) => () => void
+      onSendDeclined: (cb: () => void) => () => void
+
+      getIncomingOffer: () => Promise<{ name: string; size: number } | null>
+      acceptIncoming: () => Promise<boolean>
+      declineIncoming: () => Promise<boolean>
+      onIncomingOffer: (cb: (d: { name: string; size: number }) => void) => () => void
+
       getCurrentTransfer: () => Promise<{ name: string; size: number; isSending: boolean } | null>
-      onFileTransferStart: (cb: (data: { name: string; size: number; isSending: boolean }) => void) => () => void
-      onFileProgress: (cb: (data: { bytes: number; isSending: boolean }) => void) => () => void
-      onFileDone: (cb: (data: { name: string; isSending: boolean }) => void) => () => void
+      getLastTransfer: () => Promise<{ name: string; size: number; isSending: boolean } | null>
+      onFileTransferStart: (cb: (m: { name: string; size: number; isSending: boolean }) => void) => () => void
+      onFileProgress: (cb: (d: { bytes: number; isSending: boolean }) => void) => () => void
+      onFileDone: (cb: (d: { name: string; isSending: boolean }) => void) => () => void
     }
   }
 }
