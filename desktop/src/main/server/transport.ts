@@ -1,20 +1,22 @@
 /**
  * WORKFLOW OF THIS FILE:
  * 1. Owns the WebSocket server, the peer, and the offer/accept handshake.
- * 2. SENDING: after accept, the file is read in 1 MB segments. Each segment is
- *    wrapped in a binary frame: [4-byte header length][header JSON][bytes].
- *    ORDER MATTERS: register the ack promise, SEND the frame, then await the
- *    ack before moving to the next segment (sequential transfer).
- * 3. RECEIVING: on accept, a .part file is created and pre-allocated to the
- *    full size. Each incoming segment is written at its byte offset.
- * 4. Every 25 segments a manifest sidecar is saved beside the .part file so
- *    interrupted transfers can be resumed in a later phase.
- * 5. On "file-end" the .part file is renamed to its final name (duplicates
- *    get _(1), _(2) suffixes) and the UI is notified.
+ * 2. SENDING (Phase 9): after accept, a pool of workers streams segments.
+ *    - A shared counter hands out the next segment index to any free worker.
+ *    - Each worker: read segment -> send binary frame -> await its chunk-ack.
+ *    - Several segments are in flight at once, so the link never waits idle.
+ *    - Every 2s a monitor measures the ack rate: if speed climbs it spawns
+ *      one more worker (max 8); if speed collapses it halves the pool (min 2).
+ * 3. RECEIVING: unchanged from Phase 8 - segments are written at their byte
+ *    offset in a pre-allocated .part file and acked per index, so out-of-order
+ *    arrival is perfectly fine.
+ * 4. A manifest sidecar is saved every 25 segments for future resume support.
+ * 5. On "file-end" the .part file is renamed to its final name and the UI
+ *    is notified.
  *
  * FUNCTIONS:
  *  - offerFile()         : sends metadata + segment plan, waits for accept.
- *  - startFileStream()   : send-frame-then-await-ack loop over all segments.
+ *  - startFileStream()   : spawns the adaptive worker pool and awaits it.
  *  - acceptIncoming()    : pre-allocates .part file, then replies file-accept.
  *  - handleBinaryFrame() : parses header, writes segment at offset, sends ack.
  *  - finishIncomingFile(): closes, renames, cleans sidecar, notifies UI.
@@ -29,7 +31,10 @@ export type TransferMeta = { name: string; size: number; isSending: boolean }
 
 const PING_INTERVAL_MS = 3000
 const PONG_TIMEOUT_MS = 10000
-const CHUNK_SIZE = 4 * 1024 * 1024 // 1 MB segments
+const CHUNK_SIZE = 4 * 1024 * 1024 // 4 MB segments
+const MIN_WORKERS = 2
+const START_WORKERS = 4
+const MAX_WORKERS = 8
 
 export class TransportServer {
   private wss: WebSocketServer
@@ -139,7 +144,7 @@ export class TransportServer {
     ws.on('error', (err) => console.warn('[transport] peer error', err))
   }
 
-  // ---------- sending ----------
+  // ---------- sending: adaptive parallel workers ----------
   offerFile(filePath: string): void {
     if (!this.peerWs) return
     this.pendingFilePath = filePath
@@ -168,29 +173,85 @@ export class TransportServer {
     this.peerWs.send(JSON.stringify({ type: 'file-start', name, size }))
 
     const fd = fs.openSync(filePath, 'r')
-    try {
-      for (let i = 0; i < count; i++) {
-        if (this.sendAborted || !this.peerWs) break
-        const offset = i * CHUNK_SIZE
-        const len = Math.min(CHUNK_SIZE, size - offset)
-        const buf = Buffer.alloc(len)
-        fs.readSync(fd, buf, 0, len, offset)
+    const self = this
+    let nextIndex = 0
+    let activeWorkers = 0
+    let targetWorkers = count === 0 ? 1 : Math.min(START_WORKERS, count)
+    let ackedBytes = 0
+    let lastSampleBytes = 0
+    let lastSampleTime = Date.now()
+    let lastRate = 0
+    const workers: Promise<void>[] = []
 
-        const header = Buffer.from(JSON.stringify({ i, o: offset, l: len }), 'utf8')
-        const prefix = Buffer.alloc(4)
-        prefix.writeUInt32BE(header.length, 0)
+    // one worker: grab indices from the shared queue until done or shed
+    function workerLoop(): Promise<void> {
+      activeWorkers++
+      return (async () => {
+        try {
+          while (nextIndex < count && !self.sendAborted && self.peerWs) {
+            if (activeWorkers > targetWorkers) break // pool shrank: shed this worker
+            const i = nextIndex++
+            const offset = i * CHUNK_SIZE
+            const len = Math.min(CHUNK_SIZE, size - offset)
+            const buf = Buffer.alloc(len)
+            fs.readSync(fd, buf, 0, len, offset) // positional read: safe to share fd
 
-        // 1) register the ack promise, 2) SEND, 3) then wait for the ack
-        const ackPromise = new Promise<void>((resolve) => { this.ackResolvers.set(i, resolve) })
-        this.peerWs.send(Buffer.concat([prefix, header, buf]))
-        await ackPromise
-        if (this.sendAborted || !this.peerWs) break
-        this.onFileProgress?.(len, true)
-      }
-    } finally {
-      fs.closeSync(fd)
+            const header = Buffer.from(JSON.stringify({ i, o: offset, l: len }), 'utf8')
+            const prefix = Buffer.alloc(4)
+            prefix.writeUInt32BE(header.length, 0)
+
+            const ackPromise = new Promise<void>((resolve) => { self.ackResolvers.set(i, resolve) })
+            self.peerWs.send(Buffer.concat([prefix, header, buf]))
+            await ackPromise
+            if (self.sendAborted || !self.peerWs) break
+            ackedBytes += len
+            self.onFileProgress?.(len, true)
+          }
+        } finally {
+          activeWorkers--
+        }
+      })()
     }
 
+    // AIMD monitor: grow while speed climbs, halve when it collapses
+    const monitor = setInterval(() => {
+      const now = Date.now()
+      const dt = (now - lastSampleTime) / 1000
+      if (dt <= 0) return
+      const rate = (ackedBytes - lastSampleBytes) / dt
+      lastSampleBytes = ackedBytes
+      lastSampleTime = now
+      if (lastRate > 0 && rate > 0) {
+        if (rate > lastRate * 1.05 && targetWorkers < MAX_WORKERS) {
+          targetWorkers++
+          workers.push(workerLoop())
+          console.log(`[transport] speed up, workers -> ${targetWorkers}`)
+        } else if (rate < lastRate * 0.7 && targetWorkers > MIN_WORKERS) {
+          targetWorkers = Math.max(MIN_WORKERS, Math.floor(targetWorkers / 2))
+          console.log(`[transport] speed down, workers -> ${targetWorkers}`)
+        }
+      }
+      lastRate = rate
+    }, 2000)
+
+    // spawn the initial pool
+    for (let w = 0; w < targetWorkers; w++) workers.push(workerLoop())
+
+    // drain: keep awaiting until no new workers exist (monitor may add some)
+    let awaited = 0
+    while (awaited < workers.length) {
+      const batch = workers.slice(awaited)
+      awaited = workers.length
+      await Promise.all(batch)
+    }
+    clearInterval(monitor)
+    while (awaited < workers.length) {
+      const batch = workers.slice(awaited)
+      awaited = workers.length
+      await Promise.all(batch)
+    }
+
+    fs.closeSync(fd)
     if (!this.sendAborted && this.peerWs) {
       this.peerWs.send(JSON.stringify({ type: 'file-end' }))
       this.onFileDone?.(name, true)
