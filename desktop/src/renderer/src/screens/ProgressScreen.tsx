@@ -2,9 +2,11 @@
  * WORKFLOW OF THIS FILE:
  * 1. Shows live progress for the active transfer (sending or receiving).
  * 2. Bytes accumulate in refs; speed math runs in the IPC event handler.
- * 3. While receiving, once all bytes arrive the subtitle switches to
- *    "Checking file..." until the main process reports the hash verdict.
- * 4. Navigates to Complete when main reports file-done (verified or not).
+ * 3. RESUME: when a transfer start event carries "resumed" bytes (a transfer
+ *    continuing after reconnect), the counters seed from that value so the
+ *    ring opens at e.g. 61% and climbs from there instead of restarting.
+ * 4. While receiving, at 100% the subtitle shows "Checking file..." until
+ *    the hash verdict arrives, then navigates to Complete.
  */
 import { useEffect, useRef, useState } from "react";
 import { Button } from "../components/primitives";
@@ -52,12 +54,16 @@ export function ProgressScreen() {
 
     window.flova.getCurrentTransfer().then((t) => {
       if (cancelled || !t) return;
+      const seed = t.resumed ?? 0;
+      bytesRef.current = seed; windowBytesRef.current = seed; windowStartRef.current = Date.now();
+      setTransferred(seed);
       setFileName(t.name); setTotalBytes(t.size); setIsSending(t.isSending);
     });
 
-    const offStart = window.flova.onFileTransferStart(({ name, size, isSending: sending }) => {
-      bytesRef.current = 0; windowStartRef.current = Date.now(); windowBytesRef.current = 0;
-      setTransferred(0); setSpeed(0);
+    const offStart = window.flova.onFileTransferStart(({ name, size, isSending: sending, resumed }) => {
+      const seed = resumed ?? 0;
+      bytesRef.current = seed; windowBytesRef.current = seed; windowStartRef.current = Date.now();
+      setTransferred(seed); setSpeed(0);
       setFileName(name); setTotalBytes(size); setIsSending(sending);
     });
 

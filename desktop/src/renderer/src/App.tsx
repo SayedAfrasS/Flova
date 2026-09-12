@@ -1,8 +1,10 @@
 /**
  * WORKFLOW OF THIS FILE:
  * 1. Root of the desktop UI: picks the screen from the nav store.
- * 2. Globally watches for incoming file offers: if one arrives while the user
- *    is on Home, it jumps to the Receive screen automatically.
+ * 2. Global watchers:
+ *    - incoming file offer while on Home -> jump to the Receive screen.
+ *    - any transfer start (including a RESUME after reconnect) while on
+ *      Home -> jump to the Progress screen so the user sees it continue.
  */
 import { useEffect, type ComponentType } from "react";
 import { useNav, type Screen } from "./state/nav";
@@ -34,11 +36,15 @@ export default function App() {
   const CurrentScreen = SCREENS[screen];
 
   useEffect(() => {
-    const off = window.flova?.onIncomingOffer(() => {
+    const offOffer = window.flova?.onIncomingOffer(() => {
       const nav = useNav.getState();
       if (nav.screen === "home") nav.go("receive");
     });
-    return () => { off?.(); };
+    const offStart = window.flova?.onFileTransferStart(() => {
+      const nav = useNav.getState();
+      if (nav.screen === "home") nav.go("progress");
+    });
+    return () => { offOffer?.(); offStart?.(); };
   }, []);
 
   if (screen === "connect") return <ConnectScreen />;
