@@ -1,19 +1,18 @@
 /// WORKFLOW OF THIS FILE:
 /// 1. Owns the WebSocket and the symmetric offer/accept handshake.
-/// 2. RESUME (Phase 11):
-///    - sendFile() saves a send-side sidecar (transferId, path, size, hash).
-///    - After hello-ack, if a send sidecar exists the phone proposes
-///      "resume-offer"; the laptop matches its .part sidecar and replies
-///      "resume-accept" with the indices already on disk.
-///    - As receiver, a matching "resume-offer" reopens the .part file and
-///      replies with the local bitmap; workers then fetch only missing parts.
-///    - Progress counters seed with the resumed byte count so the UI opens
-///      at the interrupted percentage and climbs from there.
-///    - Sidecars are deleted on success, on decline, or when stale.
-/// 3. Integrity: per-segment SHA-256 via NativeSha256 (nack + resend on
+/// 2. RESUME: send-side sidecar + recv-side sidecar survive crashes and app
+///    relaunches; after hello the sender proposes resume-offer, the receiver
+///    matches its bitmap and replies resume-accept; workers then fetch only
+///    missing indices and progress seeds from the resumed byte count.
+/// 3. RESUME-RELAUNCH: on every successful hello-ack the session (host, port,
+///    peer name) is persisted via SessionStore so a relaunched app can
+///    reconnect with one tap instead of a new QR scan. Resume events that
+///    fire before the Home screen mounts are stashed in lastResumeEvent and
+///    consumed by the Home screen in initState.
+/// 4. Integrity: per-segment SHA-256 via NativeSha256 (nack + resend on
 ///    mismatch) and a whole-file hash re-checked after file-end.
-/// 4. Sending: adaptive worker pool (2-8) over a missing-index queue.
-/// 5. Receiving: serialized offset writes into a pre-allocated .part file;
+/// 5. Sending: adaptive worker pool (2-8) over a missing-index queue.
+/// 6. Receiving: serialized offset writes into a pre-allocated .part file;
 ///    recv sidecar updated every 25 segments so crashes lose nothing.
 ///
 /// FUNCTIONS:
@@ -22,9 +21,9 @@
 ///  - _streamFile()         : worker pool over the missing-index queue.
 ///  - acceptIncomingFile()  : fresh receive: pre-allocate .part, reply accept.
 ///  - _handleResumeOffer()  : match sidecar, reopen .part, reply accept.
+///  - takeLastResumeEvent() : hand a pre-mount resume event to the UI once.
 ///  - _writeFrame()         : verify hash -> write at offset -> ack or nack.
 ///  - _finishIncomingFile() : whole-file verify, rename or delete, emit done.
-///  - hasPendingResume()    : UI helper: is there unfinished transfer state?
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -32,6 +31,7 @@ import 'dart:typed_data';
 import 'package:path_provider/path_provider.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'native_sha256.dart';
+import 'session_store.dart';
 
 enum TransportState { idle, connecting, connected, paired, reconnecting, disconnected, error }
 enum SendState { idle, waitingAccept, accepted, declined }
@@ -88,6 +88,15 @@ class TransportClient {
   final Map<int, Completer<void>> _ackWaiters = {};
   final List<int> _resendQueue = [];
 
+  // RESUME-RELAUNCH: resume event that fired before any UI was listening
+  FileEvent? _lastResumeEvent;
+  FileEvent? get lastResumeEvent => _lastResumeEvent;
+  FileEvent? takeLastResumeEvent() {
+    final e = _lastResumeEvent;
+    _lastResumeEvent = null;
+    return e;
+  }
+
   final StreamController<TransportState> _stateCtrl = StreamController<TransportState>.broadcast();
   final StreamController<int> _progressCtrl = StreamController<int>.broadcast();
   final StreamController<FileEvent> _fileEventCtrl = StreamController<FileEvent>.broadcast();
@@ -105,7 +114,6 @@ class TransportClient {
   static const Duration pongTimeout = Duration(seconds: 10);
   static const List<Duration> backoff = [Duration(seconds: 1), Duration(seconds: 2), Duration(seconds: 4), Duration(seconds: 8), Duration(seconds: 15)];
 
-  // ---------- sidecar paths ----------
   Future<File> _sendSidecarFile() async {
     final dir = await getApplicationDocumentsDirectory();
     return File('${dir.path}/flova-pending-send.json');
@@ -120,7 +128,6 @@ class TransportClient {
     return d;
   }
 
-  // UI helper: unfinished send sidecar or any recv sidecar on disk?
   Future<bool> hasPendingResume() async {
     try {
       final sc = await _sendSidecarFile();
@@ -167,6 +174,10 @@ class TransportClient {
           peerName = msg['name'] as String?;
           _reconnectAttempt = 0; _lastPongMs = DateTime.now().millisecondsSinceEpoch;
           _startHeartbeat(); _stateCtrl.add(TransportState.paired);
+          // RESUME-RELAUNCH: remember how to reach this laptop next launch
+          if (_host != null && _port != null) {
+            SessionStore.save(host: _host!, port: _port!, peerName: peerName ?? 'Laptop');
+          }
           _maybeOfferResume();
         } else if (type == 'ping') {
           _channel?.sink.add(jsonEncode({'type': 'pong'}));
@@ -207,7 +218,9 @@ class TransportClient {
             }
             _sentBytes = resumed;
             _sendStateCtrl.add(SendState.accepted);
-            _fileEventCtrl.add(FileEvent(name: _pendingSendName, size: _pendingSendSize, sending: true, isResume: true));
+            final ev = FileEvent(name: _pendingSendName, size: _pendingSendSize, sending: true, isResume: true);
+            _lastResumeEvent = ev; // stash in case UI is not mounted yet
+            _fileEventCtrl.add(ev);
             _streamFile(file, received, resumed);
             _pendingSendFile = null;
           }
@@ -234,7 +247,6 @@ class TransportClient {
     final fileHash = await NativeSha256.hashFile(file.path);
     _pendingSendHash = fileHash;
     final transferId = 't${DateTime.now().millisecondsSinceEpoch}';
-    // remember what we are shipping so a reconnect can resume it
     try {
       final sc = await _sendSidecarFile();
       await sc.writeAsString(jsonEncode({
@@ -263,7 +275,6 @@ class TransportClient {
     } catch (_) {}
   }
 
-  // after hello-ack: propose resuming an interrupted send, if any
   Future<void> _maybeOfferResume() async {
     try {
       final sc = await _sendSidecarFile();
@@ -301,7 +312,6 @@ class TransportClient {
 
     _channel!.sink.add(jsonEncode({'type': 'file-start', 'name': _pendingSendName, 'size': size}));
 
-    // queue only the indices the receiver does not have yet
     final missing = <int>[];
     for (var i = 0; i < count; i++) {
       if (!skip.contains(i)) missing.add(i);
@@ -395,7 +405,7 @@ class TransportClient {
 
     if (!_sendAborted && _channel != null) {
       _channel!.sink.add(jsonEncode({'type': 'file-end'}));
-      await _clearSendSidecar(); // finished: nothing left to resume
+      await _clearSendSidecar();
     }
     _resumeState = null;
   }
@@ -405,7 +415,6 @@ class TransportClient {
     if (_pendingOfferName == null) return;
     final saveDir = await _recvDir();
 
-    // sweep orphaned sidecars/.part files from dead transfers
     await for (final e in saveDir.list()) {
       if (e.path.endsWith('.flova.json') && !e.path.contains(_pendingOfferId!)) {
         try {
@@ -439,7 +448,6 @@ class TransportClient {
     _pendingOfferName = null; _pendingOfferSize = 0; _pendingOfferId = null; _pendingOfferHash = null;
   }
 
-  // receiver side of resume: match sidecar, reopen .part, report bitmap
   Future<void> _handleResumeOffer(Map<String, dynamic> msg) async {
     final transferId = (msg['transferId'] ?? '') as String;
     final size = (msg['size'] as num).toInt();
@@ -460,7 +468,7 @@ class TransportClient {
       if ((sc['size'] as num).toInt() != size) throw Exception('size mismatch');
 
       final received = (sc['received'] as List? ?? []).map((e) => (e as num).toInt()).toSet();
-      final raf = await partFile.open(mode: FileMode.write); // preserves bytes
+      final raf = await partFile.open(mode: FileMode.write);
       _recvRaf = raf;
       _recvPartFile = partFile;
       _recvFinalName = name;
@@ -479,7 +487,9 @@ class TransportClient {
       _receivedBytes = resumed;
 
       _channel?.sink.add(jsonEncode({'type': 'resume-accept', 'transferId': transferId, 'received': received.toList()}));
-      _fileEventCtrl.add(FileEvent(name: name, size: size, sending: false, isResume: true));
+      final ev = FileEvent(name: name, size: size, sending: false, isResume: true);
+      _lastResumeEvent = ev; // stash in case UI is not mounted yet
+      _fileEventCtrl.add(ev);
     } catch (_) {
       _channel?.sink.add(jsonEncode({'type': 'resume-decline', 'transferId': transferId}));
     }
@@ -577,7 +587,7 @@ class TransportClient {
     _sendAborted = true;
     for (final w in _ackWaiters.values) { if (!w.isCompleted) w.complete(); }
     _ackWaiters.clear();
-    _writeSidecar(); // bitmap survives for resume
+    _writeSidecar();
     if (_host != null && _port != null) { _stateCtrl.add(TransportState.reconnecting); _scheduleReconnect(); }
     else _stateCtrl.add(TransportState.disconnected);
   }
