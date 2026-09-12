@@ -1,21 +1,23 @@
 /// WORKFLOW OF THIS FILE:
 /// 1. Owns the WebSocket and the symmetric offer/accept handshake.
-/// 2. SENDING: after the laptop accepts, the file is read in 1 MB segments.
-///    Each segment is wrapped in a binary frame:
-///    [4-byte header length][header JSON {i, o, l}][segment bytes]
-///    The phone registers the ack completer, SENDS the frame, then awaits the
-///    ack before the next segment (sequential transfer).
-/// 3. RECEIVING: on accept, a .part file is created and pre-allocated with
-///    truncate(). Incoming segments are written at their byte offset through
-///    a serialized write queue so writes can never interleave.
-/// 4. Every 25 segments a manifest sidecar is saved beside the .part file so
-///    interrupted transfers can be resumed in a later phase.
-/// 5. On "file-end" the .part file is renamed to the final name (duplicates
-///    get _(1), _(2) suffixes) and the done event fires after close.
+/// 2. SENDING (Phase 9): after the laptop accepts, a pool of workers streams
+///    segments in parallel.
+///    - A shared counter hands the next segment index to any free worker.
+///    - Each worker opens its own RandomAccessFile (async reads must not
+///      share one file pointer), reads its segment, sends the binary frame,
+///      and awaits that segment's chunk-ack.
+///    - Every 2s a monitor measures the ack rate: speed climbing spawns one
+///      more worker (max 8); speed collapsing halves the pool (min 2).
+/// 3. RECEIVING: segments are written at their byte offset through a
+///    serialized write queue inside a pre-allocated .part file, then acked
+///    per index - out-of-order arrival is fine.
+/// 4. A manifest sidecar is saved every 25 segments for future resume support.
+/// 5. On "file-end" the .part file is renamed to the final name and the done
+///    event fires after all queued writes drain.
 ///
 /// FUNCTIONS:
 ///  - sendFile()           : sends offer only; streaming starts after accept.
-///  - _streamPendingFile() : send-frame-then-await-ack loop over all segments.
+///  - _streamPendingFile() : spawns the adaptive worker pool and awaits it.
 ///  - acceptIncomingFile() : pre-allocates .part, then replies file-accept.
 ///  - _handleBinaryFrame() : queues one serialized write for a segment.
 ///  - _writeFrame()        : writes at offset, acks, reports progress.
@@ -47,7 +49,10 @@ class TransportClient {
   Timer? _pingTimer; Timer? _reconnectTimer;
   int _lastPongMs = 0; int _reconnectAttempt = 0;
 
-  static const int chunkSize = 4 * 1024 * 1024; // 1 MB segments
+  static const int chunkSize = 4 * 1024 * 1024; // 4 MB segments
+  static const int minWorkers = 2;
+  static const int startWorkers = 4;
+  static const int maxWorkers = 8;
 
   // receiving
   RandomAccessFile? _recvRaf;
@@ -59,7 +64,7 @@ class TransportClient {
   final Set<int> _recvReceived = {};
   int _receivedBytes = 0;
   String? _pendingOfferName; int _pendingOfferSize = 0; String? _pendingOfferId;
-  Future<void> _writeQueue = Future<void>.value(); // serializes offset writes
+  Future<void> _writeQueue = Future<void>.value();
 
   // sending
   File? _pendingSendFile;
@@ -149,7 +154,7 @@ class TransportClient {
     }
   }
 
-  // ---------- sending ----------
+  // ---------- sending: adaptive parallel workers ----------
   Future<void> sendFile(File file) async {
     if (_channel == null) return;
     _pendingSendFile = file;
@@ -177,32 +182,87 @@ class TransportClient {
 
     _channel!.sink.add(jsonEncode({'type': 'file-start', 'name': _pendingSendName, 'size': size}));
 
-    final raf = await file.open(mode: FileMode.read);
-    try {
-      for (var i = 0; i < count; i++) {
-        if (_sendAborted || _channel == null) break;
-        final offset = i * chunkSize;
-        final len = offset + chunkSize > size ? size - offset : chunkSize;
-        await raf.setPosition(offset);
-        final chunk = await raf.read(len);
+    int nextIndex = 0;
+    int activeWorkers = 0;
+    int targetWorkers = count == 0 ? 1 : (count < startWorkers ? count : startWorkers);
+    int ackedBytes = 0;
+    int lastSampleBytes = 0;
+    int lastSampleMs = DateTime.now().millisecondsSinceEpoch;
+    double lastRate = 0;
+    final List<Future<void>> workers = [];
+    Timer? monitor;
 
-        final headerBytes = utf8.encode(jsonEncode({'i': i, 'o': offset, 'l': chunk.length}));
-        final bb = BytesBuilder();
-        bb.add((ByteData(4)..setUint32(0, headerBytes.length)).buffer.asUint8List());
-        bb.add(headerBytes);
-        bb.add(chunk);
+    // one worker: pull indices from the shared queue until done or shed
+    void spawnWorker() {
+      activeWorkers++;
+      workers.add(() async {
+        // each worker owns its file handle: async reads must not share a pointer
+        final wraf = await file.open(mode: FileMode.read);
+        try {
+          while (nextIndex < count && !_sendAborted && _channel != null) {
+            if (activeWorkers > targetWorkers) break; // pool shrank: shed this worker
+            final i = nextIndex++;
+            final offset = i * chunkSize;
+            final len = offset + chunkSize > size ? size - offset : chunkSize;
+            await wraf.setPosition(offset);
+            final chunk = await wraf.read(len);
 
-        // 1) register completer, 2) SEND, 3) then wait for the ack
-        final waiter = Completer<void>();
-        _ackWaiters[i] = waiter;
-        _channel!.sink.add(bb.toBytes());
-        await waiter.future;
-        if (_sendAborted || _channel == null) break;
-        _sentBytes += chunk.length;
-        _progressCtrl.add(chunk.length);
+            final headerBytes = utf8.encode(jsonEncode({'i': i, 'o': offset, 'l': chunk.length}));
+            final bb = BytesBuilder();
+            bb.add((ByteData(4)..setUint32(0, headerBytes.length)).buffer.asUint8List());
+            bb.add(headerBytes);
+            bb.add(chunk);
+
+            final waiter = Completer<void>();
+            _ackWaiters[i] = waiter;
+            _channel!.sink.add(bb.toBytes());
+            await waiter.future;
+            if (_sendAborted || _channel == null) break;
+            ackedBytes += chunk.length;
+            _sentBytes += chunk.length;
+            _progressCtrl.add(chunk.length);
+          }
+        } finally {
+          await wraf.close();
+          activeWorkers--;
+        }
+      }());
+    }
+
+    // AIMD monitor: grow while speed climbs, halve when it collapses
+    monitor = Timer.periodic(const Duration(seconds: 2), (_) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final dt = (now - lastSampleMs) / 1000.0;
+      if (dt <= 0) return;
+      final rate = (ackedBytes - lastSampleBytes) / dt;
+      lastSampleBytes = ackedBytes;
+      lastSampleMs = now;
+      if (lastRate > 0 && rate > 0) {
+        if (rate > lastRate * 1.05 && targetWorkers < maxWorkers) {
+          targetWorkers++;
+          spawnWorker();
+        } else if (rate < lastRate * 0.7 && targetWorkers > minWorkers) {
+          targetWorkers = targetWorkers ~/ 2;
+          if (targetWorkers < minWorkers) targetWorkers = minWorkers;
+        }
       }
-    } finally {
-      await raf.close();
+      lastRate = rate;
+    });
+
+    for (var w = 0; w < targetWorkers; w++) spawnWorker();
+
+    // drain: keep awaiting until the monitor stops adding new workers
+    var awaited = 0;
+    while (awaited < workers.length) {
+      final batch = workers.sublist(awaited);
+      awaited = workers.length;
+      await Future.wait(batch);
+    }
+    monitor.cancel();
+    while (awaited < workers.length) {
+      final batch = workers.sublist(awaited);
+      awaited = workers.length;
+      await Future.wait(batch);
     }
 
     if (!_sendAborted && _channel != null) {
@@ -238,7 +298,6 @@ class TransportClient {
     _pendingOfferName = null; _pendingOfferSize = 0; _pendingOfferId = null;
   }
 
-  // queue every segment write so setPosition/writeFrom never interleave
   void _handleBinaryFrame(List<int> data) {
     _writeQueue = _writeQueue.then((_) => _writeFrame(data));
   }
@@ -279,8 +338,7 @@ class TransportClient {
   Future<void> _finishIncomingFile() async {
     final raf = _recvRaf;
     if (raf != null) { try { await raf.close(); } catch (_) {} _recvRaf = null; }
-    // wait for queued writes to drain before renaming
-    await _writeQueue;
+    await _writeQueue; // let queued writes drain before renaming
     final part = _recvPartFile; final dir = _recvSaveDir; final finalName = _recvFinalName;
     if (part == null || dir == null || finalName == null) return;
 
