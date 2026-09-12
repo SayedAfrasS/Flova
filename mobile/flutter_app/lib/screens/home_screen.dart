@@ -1,13 +1,12 @@
 /// WORKFLOW OF THIS FILE:
 /// 1. Mobile home shell: owns the bottom navigation bar and connection overlay.
-/// 2. Connection overlay states:
-///    - reconnecting / error / disconnected: retry or go back.
-///    - paired but an unfinished transfer exists: "Checking transfer..."
-///      while the resume handshake runs (max ~2s).
-/// 3. RESUME: when a resume event arrives (either direction), the Progress
-///    screen is pushed automatically; it opens at the interrupted percentage
-///    because the transport counters were seeded with the resumed bytes.
-/// 4. Incoming fresh offers still open the Receive screen as before.
+/// 2. Overlay states: reconnecting / error / disconnected show retry actions;
+///    paired-with-unfinished-transfer shows "Checking transfer..." briefly.
+/// 3. RESUME: a resume event (either direction) pushes the Progress screen,
+///    which opens at the interrupted percentage. If the resume handshake
+///    finished BEFORE this screen mounted (app relaunch case), the stashed
+///    event is consumed in initState and the Progress screen still opens.
+/// 4. Fresh incoming offers open the Receive screen as before.
 import 'dart:async';
 import 'package:flutter/material.dart';
 import '../core/flova_mark.dart';
@@ -42,11 +41,31 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+
+    // RESUME-RELAUNCH: consume a resume event that fired before we mounted
+    final stashed = widget.transport.takeLastResumeEvent();
+    if (stashed != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _resumePushed) return;
+        _resumePushed = true;
+        Navigator.of(context).push(MaterialPageRoute(
+          builder: (_) => ProgressScreen(
+            info: TransferInfo(
+              name: stashed.name,
+              size: _formatBytes(stashed.size),
+              bytes: stashed.size.toDouble(),
+              sending: stashed.sending,
+            ),
+            transport: widget.transport,
+          ),
+        ));
+      });
+    }
+
     _stateSub = widget.transport.stateStream.listen((s) {
       if (!mounted) return;
       setState(() => _state = s);
       if (s == TransportState.paired) {
-        // paired again: is there an unfinished transfer to resume?
         widget.transport.hasPendingResume().then((pending) {
           if (!mounted) return;
           if (pending) {
