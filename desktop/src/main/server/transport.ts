@@ -1,26 +1,30 @@
 /**
  * WORKFLOW OF THIS FILE:
  * 1. Owns the WebSocket server, the peer, and the offer/accept handshake.
- * 2. INTEGRITY (Phase 10):
- *    - offerFile() hashes the whole file first and puts that hash in the offer.
- *    - Every segment frame header carries the SHA-256 of its own payload.
- *    - The receiver hashes each incoming segment BEFORE writing it. On a
- *      mismatch it replies chunk-nack and the sender re-queues that index.
- *    - After file-end the receiver re-hashes the finished .part file and
- *      compares with the offer hash: match -> rename + verified done event,
- *      mismatch -> delete the .part and report a failed transfer.
- * 3. SENDING: adaptive worker pool (2-8) pulls segment indices from a shared
- *    queue; nacked indices jump the queue via the resend list.
- * 4. RECEIVING: segments are written at byte offset in a pre-allocated .part
- *    file; a manifest sidecar is saved every 25 segments for future resume.
+ * 2. RESUME (Phase 11):
+ *    - offerFile() also saves a send-side sidecar (userData folder) recording
+ *      transferId, file path, size and whole-file hash.
+ *    - When a peer reconnects (hello), each side checks for unfinished work:
+ *      sender sends "resume-offer"; receiver matches its .part sidecar by
+ *      transferId and replies "resume-accept" with the indices already on disk.
+ *    - The sender then streams ONLY missing indices; progress is seeded with
+ *      the bytes the receiver already has, so the UI continues from e.g. 61%.
+ *    - Sidecars are deleted on success, on decline, or when they go stale.
+ * 3. Integrity: per-segment SHA-256 in frame headers (nack + resend on
+ *    mismatch) and a whole-file hash re-checked after file-end.
+ * 4. Sending: adaptive worker pool (2-8) pulling from a missing-index queue.
+ * 5. Receiving: offset writes into a pre-allocated .part file; recv sidecar
+ *    updated every 25 segments so a crash never loses the bitmap.
  *
  * FUNCTIONS:
- *  - hashFile()          : streaming SHA-256 of a whole file.
- *  - offerFile()         : hashes file, sends offer, waits for accept.
- *  - startFileStream()   : adaptive parallel segment workers.
- *  - acceptIncoming()    : pre-allocates .part, replies file-accept.
- *  - handleBinaryFrame() : verify segment hash -> write at offset -> ack/nack.
- *  - finishIncomingFile(): whole-file verify, rename or delete, notify UI.
+ *  - hashFile()           : streaming SHA-256 of a whole file.
+ *  - offerFile()          : hash + save send sidecar + send offer.
+ *  - maybeOfferResume()   : after hello, propose resuming an interrupted send.
+ *  - startFileStream()    : worker pool over the missing-index queue.
+ *  - acceptIncoming()     : fresh receive: pre-allocate .part, reply accept.
+ *  - handleResumeOffer()  : match recv sidecar, reopen .part, reply accept.
+ *  - handleBinaryFrame()  : verify hash -> write at offset -> ack or nack.
+ *  - finishIncomingFile() : whole-file verify, rename or delete, notify UI.
  */
 import { WebSocketServer, WebSocket } from 'ws'
 import { app } from 'electron'
@@ -29,7 +33,7 @@ import * as path from 'path'
 import * as crypto from 'crypto'
 
 export type Peer = { name: string; platform: string }
-export type TransferMeta = { name: string; size: number; isSending: boolean; verified?: boolean }
+export type TransferMeta = { name: string; size: number; isSending: boolean; verified?: boolean; resumed?: number }
 
 const PING_INTERVAL_MS = 3000
 const PONG_TIMEOUT_MS = 10000
@@ -59,6 +63,7 @@ export class TransportServer {
 
   // sending state
   private pendingFilePath: string | null = null
+  private resumeState: { transferId: string } | null = null
   private ackResolvers = new Map<number, () => void>()
   private resendQueue: number[] = []
   private sendAborted = false
@@ -84,7 +89,16 @@ export class TransportServer {
     console.log(`[transport] listening on 0.0.0.0:${port}`)
   }
 
-  // streaming SHA-256 of an entire file
+  private sendSidecarPath(): string {
+    return path.join(app.getPath('userData'), 'flova-pending-send.json')
+  }
+
+  private recvDir(): string {
+    const d = path.join(app.getPath('downloads'), 'Flova')
+    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true })
+    return d
+  }
+
   private async hashFile(p: string): Promise<string> {
     const h = crypto.createHash('sha256')
     const fd = fs.openSync(p, 'r')
@@ -115,6 +129,7 @@ export class TransportServer {
           ws.send(JSON.stringify({ type: 'hello-ack', name: this.selfName, platform: 'desktop' }))
           this.startHb()
           this.onPeerConnected?.(this.peer)
+          this.maybeOfferResume()
         } else if (msg?.type === 'ping') {
           ws.send(JSON.stringify({ type: 'pong' }))
         } else if (msg?.type === 'pong') {
@@ -124,7 +139,6 @@ export class TransportServer {
           const resolve = this.ackResolvers.get(i)
           if (resolve) { this.ackResolvers.delete(i); resolve() }
         } else if (msg?.type === 'chunk-nack') {
-          // damaged segment: put it back at the front of the work queue
           const i = Number(msg.i)
           if (!this.resendQueue.includes(i)) this.resendQueue.push(i)
         } else if (msg?.type === 'file-offer') {
@@ -139,14 +153,34 @@ export class TransportServer {
           if (this.pendingFilePath) {
             const fp = this.pendingFilePath
             this.pendingFilePath = null
-            this.startFileStream(fp)
+            this.startFileStream(fp, new Set<number>(), 0)
           }
         } else if (msg?.type === 'file-decline') {
           this.pendingFilePath = null
           this.currentTransfer = null
           this.onSendDeclined?.()
+        } else if (msg?.type === 'resume-offer') {
+          this.handleResumeOffer(msg)
+        } else if (msg?.type === 'resume-accept') {
+          const received = Array.isArray(msg.received) ? (msg.received as number[]) : []
+          if (this.resumeState && this.pendingFilePath) {
+            const skip = new Set(received)
+            let resumed = 0
+            const size = fs.statSync(this.pendingFilePath).size
+            for (const i of skip) {
+              const off = i * CHUNK_SIZE
+              resumed += Math.min(CHUNK_SIZE, size - off)
+            }
+            const fp = this.pendingFilePath
+            this.pendingFilePath = null
+            this.startFileStream(fp, skip, resumed)
+          }
+        } else if (msg?.type === 'resume-decline') {
+          this.clearSendSidecar()
+          this.resumeState = null
+          this.pendingFilePath = null
         } else if (msg?.type === 'file-start') {
-          // segments follow; write sink already open from accept
+          // segments follow; write sink already open
         } else if (msg?.type === 'file-end') {
           this.finishIncomingFile()
         }
@@ -162,7 +196,7 @@ export class TransportServer {
         for (const resolve of this.ackResolvers.values()) resolve()
         this.ackResolvers.clear()
         if (this.recvFd != null) { try { fs.closeSync(this.recvFd) } catch {} this.recvFd = null }
-        this.writeSidecar()
+        this.writeSidecar() // bitmap survives for resume
         this.currentTransfer = null
         this.onPeerDisconnected?.()
       }
@@ -175,22 +209,47 @@ export class TransportServer {
     if (!this.peerWs) return
     this.pendingFilePath = filePath
     const stats = fs.statSync(filePath)
-    const fileHash = await this.hashFile(filePath) // whole-file integrity stamp
+    const fileHash = await this.hashFile(filePath)
+    const transferId = `t${Date.now()}`
     const meta: TransferMeta = { name: path.basename(filePath), size: stats.size, isSending: true }
     this.currentTransfer = meta
     this.lastTransfer = meta
+    // remember what we are shipping so a reconnect can resume it
+    fs.writeFileSync(this.sendSidecarPath(), JSON.stringify({
+      transferId, filePath, name: meta.name, size: stats.size,
+      chunkSize: CHUNK_SIZE, chunkCount: Math.ceil(stats.size / CHUNK_SIZE), fileHash,
+    }))
     this.peerWs.send(JSON.stringify({
-      type: 'file-offer',
-      transferId: `t${Date.now()}`,
-      name: meta.name,
-      size: meta.size,
-      chunkSize: CHUNK_SIZE,
-      chunkCount: Math.ceil(meta.size / CHUNK_SIZE),
-      fileHash,
+      type: 'file-offer', transferId, name: meta.name, size: stats.size,
+      chunkSize: CHUNK_SIZE, chunkCount: Math.ceil(stats.size / CHUNK_SIZE), fileHash,
     }))
   }
 
-  private async startFileStream(filePath: string): Promise<void> {
+  private clearSendSidecar(): void {
+    try { fs.unlinkSync(this.sendSidecarPath()) } catch {}
+  }
+
+  // after hello: propose resuming an interrupted send, if any
+  private maybeOfferResume(): void {
+    const p = this.sendSidecarPath()
+    if (!fs.existsSync(p)) return
+    try {
+      const s = JSON.parse(fs.readFileSync(p, 'utf8'))
+      if (!fs.existsSync(s.filePath) || fs.statSync(s.filePath).size !== s.size) {
+        this.clearSendSidecar(); return
+      }
+      this.pendingFilePath = s.filePath
+      this.resumeState = { transferId: s.transferId }
+      this.peerWs?.send(JSON.stringify({
+        type: 'resume-offer', transferId: s.transferId, name: s.name, size: s.size,
+        chunkSize: s.chunkSize, chunkCount: s.chunkCount, fileHash: s.fileHash,
+      }))
+    } catch {
+      this.clearSendSidecar()
+    }
+  }
+
+  private async startFileStream(filePath: string, skip: Set<number>, resumedBytes: number): Promise<void> {
     if (!this.peerWs) return
     const size = fs.statSync(filePath).size
     const name = path.basename(filePath)
@@ -198,16 +257,20 @@ export class TransportServer {
     this.sendAborted = false
     this.resendQueue = []
     this.onSendAccepted?.()
-    this.onFileTransferStart?.({ name, size, isSending: true })
+    this.onFileTransferStart?.({ name, size, isSending: true, resumed: resumedBytes })
     this.peerWs.send(JSON.stringify({ type: 'file-start', name, size }))
+
+    // queue only the indices the receiver does not have yet
+    const missing: number[] = []
+    for (let i = 0; i < count; i++) if (!skip.has(i)) missing.push(i)
+    let queuePos = 0
 
     const fd = fs.openSync(filePath, 'r')
     const self = this
-    let nextIndex = 0
     let activeWorkers = 0
-    let targetWorkers = count === 0 ? 1 : Math.min(START_WORKERS, count)
-    let ackedBytes = 0
-    let lastSampleBytes = 0
+    let targetWorkers = missing.length === 0 ? 1 : Math.min(START_WORKERS, missing.length)
+    let ackedBytes = resumedBytes
+    let lastSampleBytes = resumedBytes
     let lastSampleTime = Date.now()
     let lastRate = 0
     const workers: Promise<void>[] = []
@@ -217,10 +280,11 @@ export class TransportServer {
       return (async () => {
         try {
           while (!self.sendAborted && self.peerWs) {
-            if (self.resendQueue.length === 0 && nextIndex >= count) break
+            const i = self.resendQueue.length > 0
+              ? self.resendQueue.shift()!
+              : (queuePos < missing.length ? missing[queuePos++] : -1)
+            if (i === -1) break
             if (activeWorkers > targetWorkers && self.resendQueue.length === 0) break
-            // nacked segments jump the queue, otherwise take the next index
-            const i = self.resendQueue.length > 0 ? self.resendQueue.shift()! : nextIndex++
             const offset = i * CHUNK_SIZE
             const len = Math.min(CHUNK_SIZE, size - offset)
             const buf = Buffer.alloc(len)
@@ -280,8 +344,10 @@ export class TransportServer {
     fs.closeSync(fd)
     if (!this.sendAborted && this.peerWs) {
       this.peerWs.send(JSON.stringify({ type: 'file-end' }))
+      this.clearSendSidecar() // finished: nothing left to resume
       this.onFileDone?.(name, true, true)
     }
+    this.resumeState = null
     this.currentTransfer = null
   }
 
@@ -295,8 +361,17 @@ export class TransportServer {
     const { name, size, transferId, fileHash } = this.pendingIncoming
     this.pendingIncoming = null
 
-    const saveDir = path.join(app.getPath('downloads'), 'Flova')
-    if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true })
+    const saveDir = this.recvDir()
+    // sweep orphaned sidecars/.part files from dead transfers
+    for (const f of fs.readdirSync(saveDir)) {
+      if (f.endsWith('.flova.json') && !f.includes(transferId)) {
+        try {
+          const sc = JSON.parse(fs.readFileSync(path.join(saveDir, f), 'utf8'))
+          if (sc?.name) try { fs.unlinkSync(path.join(saveDir, `${sc.name}.part`)) } catch {}
+          fs.unlinkSync(path.join(saveDir, f))
+        } catch {}
+      }
+    }
 
     const partPath = path.join(saveDir, `${name}.part`)
     this.recvFd = fs.openSync(partPath, 'w')
@@ -310,7 +385,7 @@ export class TransportServer {
     this.recvReceived = new Set<number>()
 
     this.peerWs.send(JSON.stringify({ type: 'file-accept' }))
-    const meta: TransferMeta = { name, size, isSending: false }
+    const meta: TransferMeta = { name, size, isSending: false, resumed: 0 }
     this.currentTransfer = meta
     this.lastTransfer = meta
     this.onFileTransferStart?.(meta)
@@ -322,6 +397,46 @@ export class TransportServer {
     this.peerWs.send(JSON.stringify({ type: 'file-decline' }))
   }
 
+  // receiver side of resume: match sidecar, reopen .part, report what we have
+  private handleResumeOffer(msg: any): void {
+    const transferId = String(msg.transferId ?? '')
+    const size = Number(msg.size)
+    const saveDir = this.recvDir()
+    const sidecar = path.join(saveDir, `.${transferId}.flova.json`)
+    const name = path.basename(String(msg.name))
+    const partPath = path.join(saveDir, `${name}.part`)
+    if (!transferId || !fs.existsSync(sidecar) || !fs.existsSync(partPath)) {
+      this.peerWs?.send(JSON.stringify({ type: 'resume-decline', transferId }))
+      return
+    }
+    try {
+      const sc = JSON.parse(fs.readFileSync(sidecar, 'utf8'))
+      if (sc.size !== size) throw new Error('size mismatch')
+      const received: number[] = Array.isArray(sc.received) ? sc.received : []
+      this.recvFd = fs.openSync(partPath, 'r+') // keep existing bytes
+      this.recvPartPath = partPath
+      this.recvFinalName = name
+      this.recvSize = size
+      this.recvTransferId = transferId
+      this.recvSaveDir = saveDir
+      this.recvExpectedHash = String(msg.fileHash ?? '') || null
+      this.recvReceived = new Set(received)
+      let resumed = 0
+      for (const i of this.recvReceived) {
+        const off = i * CHUNK_SIZE
+        resumed += Math.min(CHUNK_SIZE, size - off)
+      }
+      this.peerWs?.send(JSON.stringify({ type: 'resume-accept', transferId, received: Array.from(this.recvReceived) }))
+      const meta: TransferMeta = { name, size, isSending: false, resumed }
+      this.currentTransfer = meta
+      this.lastTransfer = meta
+      this.onFileTransferStart?.(meta)
+    } catch {
+      try { fs.unlinkSync(sidecar) } catch {}
+      this.peerWs?.send(JSON.stringify({ type: 'resume-decline', transferId }))
+    }
+  }
+
   private handleBinaryFrame(data: Buffer): void {
     if (this.recvFd == null) return
     try {
@@ -329,10 +444,8 @@ export class TransportServer {
       const header = JSON.parse(data.subarray(4, 4 + headerLen).toString('utf8'))
       const payload = data.subarray(4 + headerLen)
 
-      // verify segment integrity BEFORE touching the disk
       const actual = crypto.createHash('sha256').update(payload).digest('hex')
       if (header.h && actual !== header.h) {
-        console.warn(`[transport] segment ${header.i} hash mismatch, requesting resend`)
         this.peerWs?.send(JSON.stringify({ type: 'chunk-nack', i: header.i }))
         return
       }
@@ -366,7 +479,6 @@ export class TransportServer {
     const finalName = this.recvFinalName
     const expected = this.recvExpectedHash
 
-    // whole-file verdict runs async so the UI can show "Checking file..."
     ;(async () => {
       let verified = true
       if (expected) {
@@ -374,7 +486,6 @@ export class TransportServer {
         verified = actual === expected
       }
       if (!verified) {
-        console.warn('[transport] whole-file hash mismatch, discarding')
         try { fs.unlinkSync(partPath) } catch {}
         this.cleanupRecvState()
         this.onFileDone?.(finalName, false, false)
