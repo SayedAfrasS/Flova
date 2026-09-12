@@ -1,8 +1,8 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. Bridges the TransportServer events to the renderer via IPC.
- * 2. Exposes accept/decline handlers so the Receive screen controls the handshake.
- * 3. Exposes send-accepted / send-declined so the Send screen can wait properly.
+ * 1. Bridges TransportServer events to the renderer via IPC.
+ * 2. file:send awaits offerFile so the whole-file hash is ready first.
+ * 3. file:done now carries the verified flag for the Complete screen.
  */
 import { ipcMain, BrowserWindow, dialog } from 'electron'
 import * as fs from 'fs'
@@ -22,7 +22,7 @@ export function registerIpc(server: TransportServer, getInfo: () => { host: stri
   server.onSendDeclined = () => broadcast('file:send-declined')
   server.onFileTransferStart = (meta) => broadcast('file:transfer-start', meta)
   server.onFileProgress = (bytes, isSending) => broadcast('file:progress', { bytes, isSending })
-  server.onFileDone = (name, isSending) => broadcast('file:done', { name, isSending })
+  server.onFileDone = (name, isSending, verified) => broadcast('file:done', { name, isSending, verified })
 
   ipcMain.handle('net:getServer', () => getInfo())
   ipcMain.handle('net:getState', () => (peer ? 'paired' : 'waiting'))
@@ -40,7 +40,7 @@ export function registerIpc(server: TransportServer, getInfo: () => { host: stri
     } catch { return null }
   })
   ipcMain.handle('file:send', async (_, filePath: string) => {
-    try { server.offerFile(filePath); return true } catch (err) { console.error('[ipc] offer failed', err); return false }
+    try { await server.offerFile(filePath); return true } catch (err) { console.error('[ipc] offer failed', err); return false }
   })
   ipcMain.handle('file:getIncomingOffer', () => server.getIncomingOffer())
   ipcMain.handle('file:acceptIncoming', () => { server.acceptIncoming(); return true })
