@@ -1,11 +1,11 @@
 /// WORKFLOW OF THIS FILE:
 /// 1. Shows live transfer progress with a centered ring and centered stats.
-/// 2. On mount it seeds the transferred counter from the transport's real
-///    byte counters, so the screen can never sit idle at 0% if a few
-///    progress events fired before the screen opened.
-/// 3. Sending: completes when transferred bytes reach the file size.
-/// 4. Receiving: completes only on the transport's isDone event, which fires
-///    after the file is fully flushed and closed on disk.
+/// 2. Seeds transferred bytes from the transport counters on mount so the
+///    screen can never sit idle at 0%.
+/// 3. While receiving, once all bytes arrive the subtitle switches to
+///    "Checking file..." until the transport reports the hash verdict.
+/// 4. Sending completes on byte count; receiving completes on the done event
+///    and carries the verified flag into the Complete screen.
 import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
@@ -36,8 +36,6 @@ class _ProgressScreenState extends State<ProgressScreen> {
   void initState() {
     super.initState();
     _lastUpdateMs = DateTime.now().millisecondsSinceEpoch;
-
-    // seed from real counters so late mounts never show a stuck 0%
     _transferred = widget.info.sending
         ? widget.transport.sentBytes.toDouble()
         : widget.transport.receivedBytes.toDouble();
@@ -55,23 +53,33 @@ class _ProgressScreenState extends State<ProgressScreen> {
           _lastBytes = _transferred;
         }
       });
-      if (widget.info.sending && _transferred >= widget.info.bytes) _complete();
+      if (widget.info.sending && _transferred >= widget.info.bytes) _complete(true);
     });
 
     if (!widget.info.sending) {
       _fileSub = widget.transport.fileEventStream.listen((event) {
-        if (event.isDone) _complete();
+        if (event.isDone) _complete(event.ok);
       });
     }
   }
 
-  void _complete() {
+  void _complete(bool verified) {
     if (_isDone) return;
     _isDone = true;
     Future.delayed(const Duration(milliseconds: 500), () {
       if (mounted) {
         Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (_) => CompleteScreen(info: widget.info)),
+          MaterialPageRoute(
+            builder: (_) => CompleteScreen(
+              info: TransferInfo(
+                name: widget.info.name,
+                size: widget.info.size,
+                bytes: widget.info.bytes,
+                sending: widget.info.sending,
+                verified: verified,
+              ),
+            ),
+          ),
         );
       }
     });
@@ -90,6 +98,7 @@ class _ProgressScreenState extends State<ProgressScreen> {
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
     final pct = widget.info.bytes > 0 ? math.min(1.0, _transferred / widget.info.bytes) : 0.0;
+    final checking = !widget.info.sending && pct >= 1.0 && !_isDone;
     final secondsLeft = _speed > 0 ? math.max(1, ((widget.info.bytes - _transferred) / _speed).round()) : 0;
 
     return Scaffold(
@@ -129,11 +138,13 @@ class _ProgressScreenState extends State<ProgressScreen> {
                 Text('${_formatBytes(_transferred)} of ${_formatBytes(widget.info.bytes)}',
                     style: text.bodyLarge?.copyWith(color: FlovaTokens.ink), textAlign: TextAlign.center),
                 const SizedBox(height: 4),
-                Text(_speed > 0 ? '${_formatBytes(_speed)}/s' : 'Calculating speed…',
+                Text(_speed > 0 && !checking ? '${_formatBytes(_speed)}/s' : '',
                     style: text.bodyMedium, textAlign: TextAlign.center),
                 const SizedBox(height: 2),
-                Text(_speed > 0 ? 'About $secondsLeft seconds left' : '',
-                    style: text.bodyMedium?.copyWith(color: FlovaTokens.ink3), textAlign: TextAlign.center),
+                Text(
+                  checking ? 'Checking file...' : (_speed > 0 ? 'About $secondsLeft seconds left' : ''),
+                  style: text.bodyMedium?.copyWith(color: FlovaTokens.ink3), textAlign: TextAlign.center,
+                ),
               ],
             ),
           ),
