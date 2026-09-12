@@ -1,6 +1,7 @@
 /**
  * WORKFLOW OF THIS FILE:
  * 1. Declares the window.flova API types for strict renderer type checking.
+ * 2. Transfer metadata and the done event now include the verified flag.
  */
 export {}
 
@@ -24,11 +25,11 @@ declare global {
       declineIncoming: () => Promise<boolean>
       onIncomingOffer: (cb: (d: { name: string; size: number }) => void) => () => void
 
-      getCurrentTransfer: () => Promise<{ name: string; size: number; isSending: boolean } | null>
-      getLastTransfer: () => Promise<{ name: string; size: number; isSending: boolean } | null>
+      getCurrentTransfer: () => Promise<{ name: string; size: number; isSending: boolean; verified?: boolean } | null>
+      getLastTransfer: () => Promise<{ name: string; size: number; isSending: boolean; verified?: boolean } | null>
       onFileTransferStart: (cb: (m: { name: string; size: number; isSending: boolean }) => void) => () => void
       onFileProgress: (cb: (d: { bytes: number; isSending: boolean }) => void) => () => void
-      onFileDone: (cb: (d: { name: string; isSending: boolean }) => void) => () => void
+      onFileDone: (cb: (d: { name: string; isSending: boolean; verified: boolean }) => void) => () => void
     }
   }
 }
