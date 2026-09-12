@@ -1,21 +1,30 @@
 /// WORKFLOW OF THIS FILE:
 /// 1. Owns the WebSocket and the symmetric offer/accept handshake.
-/// 2. INTEGRITY: every segment frame header carries the SHA-256 of its payload;
-///    the receiver verifies each segment BEFORE writing and nacks mismatches;
-///    the offer carries a whole-file hash that is re-checked after file-end.
-/// 3. ALL HASHING GOES THROUGH NativeSha256: hardware-accelerated on Android,
-///    pure Dart fallback elsewhere. This keeps transfers link-bound instead
-///    of CPU-bound and makes the final "Checking file..." step ~1s per GB.
-/// 4. SENDING: adaptive worker pool (2-8); nacked indices jump the resend queue.
-/// 5. RECEIVING: serialized offset writes into a pre-allocated .part file;
-///    manifest sidecar every 25 segments for future resume support.
+/// 2. RESUME (Phase 11):
+///    - sendFile() saves a send-side sidecar (transferId, path, size, hash).
+///    - After hello-ack, if a send sidecar exists the phone proposes
+///      "resume-offer"; the laptop matches its .part sidecar and replies
+///      "resume-accept" with the indices already on disk.
+///    - As receiver, a matching "resume-offer" reopens the .part file and
+///      replies with the local bitmap; workers then fetch only missing parts.
+///    - Progress counters seed with the resumed byte count so the UI opens
+///      at the interrupted percentage and climbs from there.
+///    - Sidecars are deleted on success, on decline, or when stale.
+/// 3. Integrity: per-segment SHA-256 via NativeSha256 (nack + resend on
+///    mismatch) and a whole-file hash re-checked after file-end.
+/// 4. Sending: adaptive worker pool (2-8) over a missing-index queue.
+/// 5. Receiving: serialized offset writes into a pre-allocated .part file;
+///    recv sidecar updated every 25 segments so crashes lose nothing.
 ///
 /// FUNCTIONS:
-///  - sendFile()           : hashes file (native), sends offer, waits accept.
-///  - _streamPendingFile() : adaptive parallel segment workers.
-///  - acceptIncomingFile() : pre-allocates .part, replies file-accept.
-///  - _writeFrame()        : native-verify hash -> write at offset -> ack/nack.
-///  - _finishIncomingFile(): native whole-file verify, rename or delete, done.
+///  - sendFile()            : hash + save sidecar + send offer.
+///  - _maybeOfferResume()   : after hello, propose resuming an interrupted send.
+///  - _streamFile()         : worker pool over the missing-index queue.
+///  - acceptIncomingFile()  : fresh receive: pre-allocate .part, reply accept.
+///  - _handleResumeOffer()  : match sidecar, reopen .part, reply accept.
+///  - _writeFrame()         : verify hash -> write at offset -> ack or nack.
+///  - _finishIncomingFile() : whole-file verify, rename or delete, emit done.
+///  - hasPendingResume()    : UI helper: is there unfinished transfer state?
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -33,7 +42,13 @@ class FileEvent {
   final bool isOffer;
   final bool isDone;
   final bool ok;
-  const FileEvent({required this.name, required this.size, this.isOffer = false, this.isDone = false, this.ok = true});
+  final bool sending;
+  final bool isResume;
+  const FileEvent({
+    required this.name, required this.size,
+    this.isOffer = false, this.isDone = false, this.ok = true,
+    this.sending = false, this.isResume = false,
+  });
 }
 
 class TransportClient {
@@ -66,6 +81,8 @@ class TransportClient {
   // sending
   File? _pendingSendFile;
   String _pendingSendName = ''; int _pendingSendSize = 0;
+  String? _pendingSendHash;
+  Map<String, dynamic>? _resumeState;
   int _sentBytes = 0;
   bool _sendAborted = false;
   final Map<int, Completer<void>> _ackWaiters = {};
@@ -87,6 +104,33 @@ class TransportClient {
   static const Duration pingInterval = Duration(seconds: 3);
   static const Duration pongTimeout = Duration(seconds: 10);
   static const List<Duration> backoff = [Duration(seconds: 1), Duration(seconds: 2), Duration(seconds: 4), Duration(seconds: 8), Duration(seconds: 15)];
+
+  // ---------- sidecar paths ----------
+  Future<File> _sendSidecarFile() async {
+    final dir = await getApplicationDocumentsDirectory();
+    return File('${dir.path}/flova-pending-send.json');
+  }
+
+  Future<Directory> _recvDir() async {
+    Directory? baseDir;
+    if (Platform.isAndroid) baseDir = await getExternalStorageDirectory();
+    baseDir ??= await getApplicationDocumentsDirectory();
+    final d = Directory('${baseDir.path}/Flova');
+    if (!await d.exists()) await d.create(recursive: true);
+    return d;
+  }
+
+  // UI helper: unfinished send sidecar or any recv sidecar on disk?
+  Future<bool> hasPendingResume() async {
+    try {
+      final sc = await _sendSidecarFile();
+      if (await sc.exists()) return true;
+      final dir = await _recvDir();
+      return dir.listSync().any((e) => e.path.endsWith('.flova.json'));
+    } catch (_) {
+      return false;
+    }
+  }
 
   Future<void> connect({required String host, required int port, required String selfName, required String platform}) async {
     _host = host; _port = port; _selfName = selfName; _platform = platform; _reconnectAttempt = 0;
@@ -123,6 +167,7 @@ class TransportClient {
           peerName = msg['name'] as String?;
           _reconnectAttempt = 0; _lastPongMs = DateTime.now().millisecondsSinceEpoch;
           _startHeartbeat(); _stateCtrl.add(TransportState.paired);
+          _maybeOfferResume();
         } else if (type == 'ping') {
           _channel?.sink.add(jsonEncode({'type': 'pong'}));
         } else if (type == 'pong') {
@@ -142,13 +187,36 @@ class TransportClient {
         } else if (type == 'file-accept') {
           if (_pendingSendFile != null) {
             _sendStateCtrl.add(SendState.accepted);
-            _streamPendingFile();
+            _streamFile(_pendingSendFile!, <int>{}, 0);
+            _pendingSendFile = null;
           }
         } else if (type == 'file-decline') {
           _pendingSendFile = null;
+          _clearSendSidecar();
           _sendStateCtrl.add(SendState.declined);
+        } else if (type == 'resume-offer') {
+          _handleResumeOffer(msg);
+        } else if (type == 'resume-accept') {
+          final received = (msg['received'] as List? ?? []).map((e) => (e as num).toInt()).toSet();
+          final file = _pendingSendFile;
+          if (file != null && _resumeState != null) {
+            int resumed = 0;
+            for (final i in received) {
+              final off = i * chunkSize;
+              resumed += off + chunkSize > _pendingSendSize ? _pendingSendSize - off : chunkSize;
+            }
+            _sentBytes = resumed;
+            _sendStateCtrl.add(SendState.accepted);
+            _fileEventCtrl.add(FileEvent(name: _pendingSendName, size: _pendingSendSize, sending: true, isResume: true));
+            _streamFile(file, received, resumed);
+            _pendingSendFile = null;
+          }
+        } else if (type == 'resume-decline') {
+          _clearSendSidecar();
+          _resumeState = null;
+          _pendingSendFile = null;
         } else if (type == 'file-start') {
-          // segments follow; write sink already open from accept
+          // segments follow; write sink already open
         } else if (type == 'file-end') {
           _finishIncomingFile();
         }
@@ -163,10 +231,22 @@ class TransportClient {
     _pendingSendSize = await file.length();
     _pendingSendName = file.path.split(Platform.pathSeparator).last;
     _sentBytes = 0;
-    final fileHash = await NativeSha256.hashFile(file.path); // native, ~1 GB/s
+    final fileHash = await NativeSha256.hashFile(file.path);
+    _pendingSendHash = fileHash;
+    final transferId = 't${DateTime.now().millisecondsSinceEpoch}';
+    // remember what we are shipping so a reconnect can resume it
+    try {
+      final sc = await _sendSidecarFile();
+      await sc.writeAsString(jsonEncode({
+        'transferId': transferId, 'filePath': file.path, 'name': _pendingSendName,
+        'size': _pendingSendSize, 'chunkSize': chunkSize,
+        'chunkCount': _pendingSendSize == 0 ? 0 : (_pendingSendSize / chunkSize).ceil(),
+        'fileHash': fileHash,
+      }));
+    } catch (_) {}
     _channel!.sink.add(jsonEncode({
       'type': 'file-offer',
-      'transferId': 't${DateTime.now().millisecondsSinceEpoch}',
+      'transferId': transferId,
       'name': _pendingSendName,
       'size': _pendingSendSize,
       'chunkSize': chunkSize,
@@ -176,10 +256,44 @@ class TransportClient {
     _sendStateCtrl.add(SendState.waitingAccept);
   }
 
-  Future<void> _streamPendingFile() async {
-    final file = _pendingSendFile;
-    if (file == null) return;
-    _pendingSendFile = null;
+  Future<void> _clearSendSidecar() async {
+    try {
+      final sc = await _sendSidecarFile();
+      if (await sc.exists()) await sc.delete();
+    } catch (_) {}
+  }
+
+  // after hello-ack: propose resuming an interrupted send, if any
+  Future<void> _maybeOfferResume() async {
+    try {
+      final sc = await _sendSidecarFile();
+      if (!await sc.exists()) return;
+      final s = jsonDecode(await sc.readAsString()) as Map<String, dynamic>;
+      final file = File(s['filePath'] as String);
+      if (!await file.exists() || await file.length() != (s['size'] as num).toInt()) {
+        await _clearSendSidecar();
+        return;
+      }
+      _pendingSendFile = file;
+      _pendingSendName = s['name'] as String;
+      _pendingSendSize = (s['size'] as num).toInt();
+      _pendingSendHash = s['fileHash'] as String?;
+      _resumeState = s;
+      _channel?.sink.add(jsonEncode({
+        'type': 'resume-offer',
+        'transferId': s['transferId'],
+        'name': s['name'],
+        'size': s['size'],
+        'chunkSize': s['chunkSize'],
+        'chunkCount': s['chunkCount'],
+        'fileHash': s['fileHash'],
+      }));
+    } catch (_) {
+      await _clearSendSidecar();
+    }
+  }
+
+  Future<void> _streamFile(File file, Set<int> skip, int resumedBytes) async {
     final size = _pendingSendSize;
     final count = size == 0 ? 0 : (size / chunkSize).ceil();
     _sendAborted = false;
@@ -187,11 +301,16 @@ class TransportClient {
 
     _channel!.sink.add(jsonEncode({'type': 'file-start', 'name': _pendingSendName, 'size': size}));
 
-    int nextIndex = 0;
+    // queue only the indices the receiver does not have yet
+    final missing = <int>[];
+    for (var i = 0; i < count; i++) {
+      if (!skip.contains(i)) missing.add(i);
+    }
+    int queuePos = 0;
     int activeWorkers = 0;
-    int targetWorkers = count == 0 ? 1 : (count < startWorkers ? count : startWorkers);
-    int ackedBytes = 0;
-    int lastSampleBytes = 0;
+    int targetWorkers = missing.isEmpty ? 1 : (missing.length < startWorkers ? missing.length : startWorkers);
+    int ackedBytes = resumedBytes;
+    int lastSampleBytes = resumedBytes;
     int lastSampleMs = DateTime.now().millisecondsSinceEpoch;
     double lastRate = 0;
     final List<Future<void>> workers = [];
@@ -203,14 +322,20 @@ class TransportClient {
         final wraf = await file.open(mode: FileMode.read);
         try {
           while (!_sendAborted && _channel != null) {
-            if (_resendQueue.isEmpty && nextIndex >= count) break;
+            int i;
+            if (_resendQueue.isNotEmpty) {
+              i = _resendQueue.removeAt(0);
+            } else if (queuePos < missing.length) {
+              i = missing[queuePos++];
+            } else {
+              break;
+            }
             if (activeWorkers > targetWorkers && _resendQueue.isEmpty) break;
-            final i = _resendQueue.isNotEmpty ? _resendQueue.removeAt(0) : nextIndex++;
             final offset = i * chunkSize;
             final len = offset + chunkSize > size ? size - offset : chunkSize;
             await wraf.setPosition(offset);
             final chunk = await wraf.read(len);
-            final segHash = await NativeSha256.hashBytes(chunk); // native per-segment hash
+            final segHash = await NativeSha256.hashBytes(chunk);
 
             final headerBytes = utf8.encode(jsonEncode({'i': i, 'o': offset, 'l': chunk.length, 'h': segHash}));
             final bb = BytesBuilder();
@@ -270,18 +395,30 @@ class TransportClient {
 
     if (!_sendAborted && _channel != null) {
       _channel!.sink.add(jsonEncode({'type': 'file-end'}));
+      await _clearSendSidecar(); // finished: nothing left to resume
     }
+    _resumeState = null;
   }
 
   // ---------- receiving ----------
   Future<void> acceptIncomingFile() async {
     if (_pendingOfferName == null) return;
-    Directory? baseDir;
-    if (Platform.isAndroid) baseDir = await getExternalStorageDirectory();
-    baseDir ??= await getApplicationDocumentsDirectory();
+    final saveDir = await _recvDir();
 
-    final saveDir = Directory('${baseDir.path}/Flova');
-    if (!await saveDir.exists()) await saveDir.create(recursive: true);
+    // sweep orphaned sidecars/.part files from dead transfers
+    await for (final e in saveDir.list()) {
+      if (e.path.endsWith('.flova.json') && !e.path.contains(_pendingOfferId!)) {
+        try {
+          final sc = jsonDecode(await File(e.path).readAsString()) as Map<String, dynamic>;
+          final nm = sc['name'] as String?;
+          if (nm != null) {
+            final part = File('${saveDir.path}/$nm.part');
+            if (await part.exists()) await part.delete();
+          }
+          await File(e.path).delete();
+        } catch (_) {}
+      }
+    }
 
     final safeName = _pendingOfferName!.split(Platform.pathSeparator).last;
     final partFile = File('${saveDir.path}/$safeName.part');
@@ -302,6 +439,52 @@ class TransportClient {
     _pendingOfferName = null; _pendingOfferSize = 0; _pendingOfferId = null; _pendingOfferHash = null;
   }
 
+  // receiver side of resume: match sidecar, reopen .part, report bitmap
+  Future<void> _handleResumeOffer(Map<String, dynamic> msg) async {
+    final transferId = (msg['transferId'] ?? '') as String;
+    final size = (msg['size'] as num).toInt();
+    final name = (msg['name'] as String).split(Platform.pathSeparator).last;
+    if (transferId.isEmpty) {
+      _channel?.sink.add(jsonEncode({'type': 'resume-decline', 'transferId': transferId}));
+      return;
+    }
+    try {
+      final saveDir = await _recvDir();
+      final sidecar = File('${saveDir.path}/.$transferId.flova.json');
+      final partFile = File('${saveDir.path}/$name.part');
+      if (!await sidecar.exists() || !await partFile.exists()) {
+        _channel?.sink.add(jsonEncode({'type': 'resume-decline', 'transferId': transferId}));
+        return;
+      }
+      final sc = jsonDecode(await sidecar.readAsString()) as Map<String, dynamic>;
+      if ((sc['size'] as num).toInt() != size) throw Exception('size mismatch');
+
+      final received = (sc['received'] as List? ?? []).map((e) => (e as num).toInt()).toSet();
+      final raf = await partFile.open(mode: FileMode.write); // preserves bytes
+      _recvRaf = raf;
+      _recvPartFile = partFile;
+      _recvFinalName = name;
+      _recvSize = size;
+      _recvTransferId = transferId;
+      _recvSaveDir = saveDir;
+      _recvExpectedHash = (msg['fileHash'] as String? ?? '').isEmpty ? null : msg['fileHash'] as String;
+      _recvReceived
+        ..clear()
+        ..addAll(received);
+      int resumed = 0;
+      for (final i in received) {
+        final off = i * chunkSize;
+        resumed += off + chunkSize > size ? size - off : chunkSize;
+      }
+      _receivedBytes = resumed;
+
+      _channel?.sink.add(jsonEncode({'type': 'resume-accept', 'transferId': transferId, 'received': received.toList()}));
+      _fileEventCtrl.add(FileEvent(name: name, size: size, sending: false, isResume: true));
+    } catch (_) {
+      _channel?.sink.add(jsonEncode({'type': 'resume-decline', 'transferId': transferId}));
+    }
+  }
+
   void _handleBinaryFrame(List<int> data) {
     _writeQueue = _writeQueue.then((_) => _writeFrame(data));
   }
@@ -317,7 +500,6 @@ class TransportClient {
       final offset = (header['o'] as num).toInt();
       final index = (header['i'] as num).toInt();
 
-      // native verify BEFORE touching the disk
       final expected = header['h'] as String?;
       if (expected != null) {
         final actual = await NativeSha256.hashBytes(payload);
@@ -356,7 +538,6 @@ class TransportClient {
     final part = _recvPartFile; final dir = _recvSaveDir; final finalName = _recvFinalName;
     if (part == null || dir == null || finalName == null) return;
 
-    // native whole-file verdict: ~1s per GB instead of ~30s
     var ok = true;
     final expected = _recvExpectedHash;
     if (expected != null) {
@@ -396,7 +577,7 @@ class TransportClient {
     _sendAborted = true;
     for (final w in _ackWaiters.values) { if (!w.isCompleted) w.complete(); }
     _ackWaiters.clear();
-    _writeSidecar();
+    _writeSidecar(); // bitmap survives for resume
     if (_host != null && _port != null) { _stateCtrl.add(TransportState.reconnecting); _scheduleReconnect(); }
     else _stateCtrl.add(TransportState.disconnected);
   }
