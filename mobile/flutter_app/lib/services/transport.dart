@@ -1,32 +1,28 @@
 /// WORKFLOW OF THIS FILE:
 /// 1. Owns the WebSocket and the symmetric offer/accept handshake.
-/// 2. INTEGRITY (Phase 10):
-///    - sendFile() hashes the whole file first and puts it in the offer.
-///    - Every segment frame header carries the SHA-256 of its payload.
-///    - The receiver hashes each segment BEFORE writing; on mismatch it
-///      replies chunk-nack and the sender re-queues that index.
-///    - After file-end the receiver re-hashes the finished .part file and
-///      compares with the offer hash: match -> rename + done(ok: true),
-///      mismatch -> delete the .part + done(ok: false).
-/// 3. SENDING: adaptive worker pool (2-8), each worker owns a file handle;
-///    nacked indices jump the queue via the resend list.
-/// 4. RECEIVING: serialized offset writes into a pre-allocated .part file;
+/// 2. INTEGRITY: every segment frame header carries the SHA-256 of its payload;
+///    the receiver verifies each segment BEFORE writing and nacks mismatches;
+///    the offer carries a whole-file hash that is re-checked after file-end.
+/// 3. ALL HASHING GOES THROUGH NativeSha256: hardware-accelerated on Android,
+///    pure Dart fallback elsewhere. This keeps transfers link-bound instead
+///    of CPU-bound and makes the final "Checking file..." step ~1s per GB.
+/// 4. SENDING: adaptive worker pool (2-8); nacked indices jump the resend queue.
+/// 5. RECEIVING: serialized offset writes into a pre-allocated .part file;
 ///    manifest sidecar every 25 segments for future resume support.
 ///
 /// FUNCTIONS:
-///  - _hashFile()          : streaming SHA-256 of a whole file.
-///  - sendFile()           : hashes file, sends offer, waits for accept.
+///  - sendFile()           : hashes file (native), sends offer, waits accept.
 ///  - _streamPendingFile() : adaptive parallel segment workers.
 ///  - acceptIncomingFile() : pre-allocates .part, replies file-accept.
-///  - _writeFrame()        : verify hash -> write at offset -> ack or nack.
-///  - _finishIncomingFile(): whole-file verify, rename or delete, emit done.
+///  - _writeFrame()        : native-verify hash -> write at offset -> ack/nack.
+///  - _finishIncomingFile(): native whole-file verify, rename or delete, done.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
-import 'package:crypto/crypto.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
+import 'native_sha256.dart';
 
 enum TransportState { idle, connecting, connected, paired, reconnecting, disconnected, error }
 enum SendState { idle, waitingAccept, accepted, declined }
@@ -38,15 +34,6 @@ class FileEvent {
   final bool isDone;
   final bool ok;
   const FileEvent({required this.name, required this.size, this.isOffer = false, this.isDone = false, this.ok = true});
-}
-
-// collects the final digest from a chunked sha256 conversion
-class _DigestSink implements Sink<Digest> {
-  Digest? digest;
-  @override
-  void add(Digest d) => digest = d;
-  @override
-  void close() {}
 }
 
 class TransportClient {
@@ -100,16 +87,6 @@ class TransportClient {
   static const Duration pingInterval = Duration(seconds: 3);
   static const Duration pongTimeout = Duration(seconds: 10);
   static const List<Duration> backoff = [Duration(seconds: 1), Duration(seconds: 2), Duration(seconds: 4), Duration(seconds: 8), Duration(seconds: 15)];
-
-  Future<String> _hashFile(File f) async {
-    final ds = _DigestSink();
-    final input = sha256.startChunkedConversion(ds);
-    await for (final chunk in f.openRead()) {
-      input.add(chunk);
-    }
-    input.close();
-    return ds.digest!.toString();
-  }
 
   Future<void> connect({required String host, required int port, required String selfName, required String platform}) async {
     _host = host; _port = port; _selfName = selfName; _platform = platform; _reconnectAttempt = 0;
@@ -186,7 +163,7 @@ class TransportClient {
     _pendingSendSize = await file.length();
     _pendingSendName = file.path.split(Platform.pathSeparator).last;
     _sentBytes = 0;
-    final fileHash = await _hashFile(file); // whole-file integrity stamp
+    final fileHash = await NativeSha256.hashFile(file.path); // native, ~1 GB/s
     _channel!.sink.add(jsonEncode({
       'type': 'file-offer',
       'transferId': 't${DateTime.now().millisecondsSinceEpoch}',
@@ -233,7 +210,7 @@ class TransportClient {
             final len = offset + chunkSize > size ? size - offset : chunkSize;
             await wraf.setPosition(offset);
             final chunk = await wraf.read(len);
-            final segHash = sha256.convert(chunk).toString();
+            final segHash = await NativeSha256.hashBytes(chunk); // native per-segment hash
 
             final headerBytes = utf8.encode(jsonEncode({'i': i, 'o': offset, 'l': chunk.length, 'h': segHash}));
             final bb = BytesBuilder();
@@ -340,11 +317,14 @@ class TransportClient {
       final offset = (header['o'] as num).toInt();
       final index = (header['i'] as num).toInt();
 
-      // verify segment integrity BEFORE touching the disk
+      // native verify BEFORE touching the disk
       final expected = header['h'] as String?;
-      if (expected != null && sha256.convert(payload).toString() != expected) {
-        _channel?.sink.add(jsonEncode({'type': 'chunk-nack', 'i': index}));
-        return;
+      if (expected != null) {
+        final actual = await NativeSha256.hashBytes(payload);
+        if (actual != expected) {
+          _channel?.sink.add(jsonEncode({'type': 'chunk-nack', 'i': index}));
+          return;
+        }
       }
 
       await raf.setPosition(offset);
@@ -376,11 +356,11 @@ class TransportClient {
     final part = _recvPartFile; final dir = _recvSaveDir; final finalName = _recvFinalName;
     if (part == null || dir == null || finalName == null) return;
 
-    // whole-file verdict; UI shows "Checking file..." during this await
+    // native whole-file verdict: ~1s per GB instead of ~30s
     var ok = true;
     final expected = _recvExpectedHash;
     if (expected != null) {
-      final actual = await _hashFile(part);
+      final actual = await NativeSha256.hashFile(part.path);
       ok = actual == expected;
     }
 
