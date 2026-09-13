@@ -1,11 +1,10 @@
 /// WORKFLOW OF THIS FILE:
-/// 1. Shows live transfer progress with a centered ring and centered stats.
-/// 2. Seeds transferred bytes from the transport counters on mount so the
-///    screen can never sit idle at 0%.
-/// 3. While receiving, once all bytes arrive the subtitle switches to
-///    "Checking file..." until the transport reports the hash verdict.
-/// 4. Sending completes on byte count; receiving completes on the done event
-///    and carries the verified flag into the Complete screen.
+/// 1. Shows live progress with a centered ring and centered stats.
+/// 2. Seeds transferred bytes from transport counters on mount (resume-safe).
+/// 3. Completion in BOTH directions now waits for the done event, which only
+///    fires after the receiver's hash verdict (verify-result) arrives, so the
+///    Complete screen always shows the true result.
+/// 4. At 100% the subtitle shows "Checking file..." until that verdict lands.
 import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
@@ -41,6 +40,7 @@ class _ProgressScreenState extends State<ProgressScreen> {
         : widget.transport.receivedBytes.toDouble();
     _lastBytes = _transferred;
 
+    // ring + speed only; completion comes from the done event below
     _sub = widget.transport.progressStream.listen((bytes) {
       if (_isDone) return;
       final now = DateTime.now().millisecondsSinceEpoch;
@@ -53,14 +53,11 @@ class _ProgressScreenState extends State<ProgressScreen> {
           _lastBytes = _transferred;
         }
       });
-      if (widget.info.sending && _transferred >= widget.info.bytes) _complete(true);
     });
 
-    if (!widget.info.sending) {
-      _fileSub = widget.transport.fileEventStream.listen((event) {
-        if (event.isDone) _complete(event.ok);
-      });
-    }
+    _fileSub = widget.transport.fileEventStream.listen((event) {
+      if (event.isDone && event.sending == widget.info.sending) _complete(event.ok);
+    });
   }
 
   void _complete(bool verified) {
@@ -98,7 +95,7 @@ class _ProgressScreenState extends State<ProgressScreen> {
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
     final pct = widget.info.bytes > 0 ? math.min(1.0, _transferred / widget.info.bytes) : 0.0;
-    final checking = !widget.info.sending && pct >= 1.0 && !_isDone;
+    final checking = pct >= 1.0 && !_isDone;
     final secondsLeft = _speed > 0 ? math.max(1, ((widget.info.bytes - _transferred) / _speed).round()) : 0;
 
     return Scaffold(
