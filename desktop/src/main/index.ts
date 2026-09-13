@@ -1,80 +1,104 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. Entry point of the desktop app (main process).
- * 2. On app ready: detects the local hotspot IP, starts the WS server,
- *    registers the IPC handlers, then creates the main window.
- * 3. On window close (macOS style), keeps the server alive.
- * 4. On activate (macOS dock click), recreates the window.
+ * 1. Creates the Electron main window and initializes the transport server.
+ * 2. Sets up IPC bridges between main and renderer processes.
+ * 3. Forwards transfer events from server to renderer via IPC.
+ * 4. Handles app lifecycle events (ready, quit, etc.).
  *
  * FUNCTIONS:
- *  - createWindow() : creates the BrowserWindow and loads the renderer.
+ *  - createWindow()     : create the main browser window.
+ *  - setupEventForwarding() : wire server events to IPC.
  */
-import { app, shell, BrowserWindow } from 'electron'
-import { join } from 'path'
-import { electronApp, optimizer, is } from '@electron-toolkit/utils'
-import icon from '../../resources/icon.png?asset'
-import { detectLocalIp } from './server/network'
-import { TransportServer } from './server/transport'
-import { registerIpc } from './ipc'
 
-const SELF_NAME = "Afras's Laptop"
-const PORT = 8431
+import { app, BrowserWindow } from 'electron';
+import * as path from 'path';
+import { TransportServer } from './server/transport';
+import { setupIPC } from './ipc';
 
-let server: TransportServer | null = null
-let serverInfo = { host: '0.0.0.0', port: PORT }
+let mainWindow: BrowserWindow | null = null;
+let server: TransportServer | null = null;
 
-function startServer(): void {
-  const detected = detectLocalIp()
-  if (detected) {
-    serverInfo.host = detected.host
-    console.log(`[main] using interface ${detected.iface} → ${detected.host}`)
-  } else {
-    console.warn('[main] no external IPv4 found, using 0.0.0.0')
-  }
-  server = new TransportServer(PORT, SELF_NAME)
-  registerIpc(server, () => serverInfo)
-}
-
-function createWindow(): void {
-  const mainWindow = new BrowserWindow({
-    width: 1100,
-    height: 780,
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1200,
+    height: 800,
     minWidth: 800,
     minHeight: 600,
-    show: false,
-    title: 'Flova',
-    autoHideMenuBar: true,
-    ...(process.platform === 'linux' ? { icon } : {}),
     webPreferences: {
-      preload: join(__dirname, '../preload/index.js'),
-      sandbox: false,
+      preload: path.join(__dirname, '../preload/index.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
     },
-  })
+  });
 
-  mainWindow.on('ready-to-show', () => mainWindow.show())
-  mainWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
-    return { action: 'deny' }
-  })
-
-  if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
-    mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+  if (process.env.NODE_ENV === 'development') {
+    mainWindow.loadURL('http://localhost:5173');
+    mainWindow.webContents.openDevTools();
   } else {
-    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
   }
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+}
+
+function setupEventForwarding() {
+  if (!server || !mainWindow) return;
+
+  server.onPeerConnected = (peer) => {
+    mainWindow?.webContents.send('net:peer-connected', peer.name);
+  };
+
+  server.onPeerDisconnected = () => {
+    mainWindow?.webContents.send('net:peer-disconnected');
+  };
+
+  server.onSendAccepted = (id) => {
+    mainWindow?.webContents.send('file:send-accepted', id);
+  };
+
+  server.onSendDeclined = (id) => {
+    mainWindow?.webContents.send('file:send-declined', id);
+  };
+
+  server.onFileTransferStart = (meta) => {
+    mainWindow?.webContents.send('file:transfer-start', meta);
+  };
+
+  server.onFileProgress = (id, bytes, isSending) => {
+    mainWindow?.webContents.send('file:progress', id, bytes, isSending);
+  };
+
+  server.onFileDone = (id, name, isSending, verified) => {
+    mainWindow?.webContents.send('file:done', id, name, isSending, verified);
+  };
+
+  server.onIncomingOffer = (id, name, size) => {
+    mainWindow?.webContents.send('file:incoming-offer', id, name, size);
+  };
 }
 
 app.whenReady().then(() => {
-  electronApp.setAppUserModelId('com.flova')
-  app.on('browser-window-created', (_, window) => optimizer.watchWindowShortcuts(window))
-  startServer()
-  createWindow()
+  server = new TransportServer(8431);
+  createWindow();
+  setupEventForwarding();
+  setupIPC(server);
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
-  })
-})
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow();
+    }
+  });
+});
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
-})
+  if (process.platform !== 'darwin') {
+    server?.shutdown();
+    app.quit();
+  }
+});
+
+app.on('before-quit', () => {
+  server?.shutdown();
+});
