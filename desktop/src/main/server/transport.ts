@@ -1,554 +1,420 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. Owns the WebSocket server, the peer, and the offer/accept handshake.
- * 2. SENDING: adaptive worker pool streams missing segments; after file-end
- *    the sender WAITS for the receiver's verify-result (20s timeout) before
- *    reporting done, so a failed hash can never look like a success here.
- * 3. RECEIVING: offset writes into a pre-allocated .part file; after the
- *    whole-file hash check the receiver sends verify-result {ok} back.
- * 4. RESUME: send sidecar + recv sidecar survive crashes; resume-offer /
- *    resume-accept exchange replays only the missing segments.
- * 5. Integrity: per-segment SHA-256 in frame headers (nack + resend).
+ * 1. Manages the WebSocket server and peer connection.
+ * 2. Handles multi-file transfers: files are queued and sent sequentially.
+ * 3. Each file gets its own offer → accept → stream → verify cycle.
+ * 4. Progress events include the queue ID so the UI can track each file.
+ * 5. Supports cancellation of the active transfer and queued files.
  *
  * FUNCTIONS:
- *  - offerFile()          : hash + save sidecar + send offer.
- *  - maybeOfferResume()   : after hello, propose resuming an interrupted send.
- *  - startFileStream()    : worker pool, then await receiver verdict.
- *  - acceptIncoming()     : pre-allocate .part, reply file-accept.
- *  - handleResumeOffer()  : match sidecar, reopen .part, reply resume-accept.
- *  - handleBinaryFrame()  : verify hash -> write at offset -> ack or nack.
- *  - finishIncomingFile() : whole-file verify, send verify-result, rename.
+ *  - enqueueFile()        : add a file to the transfer queue.
+ *  - cancelTransfer()     : cancel a specific file or the active transfer.
+ *  - processQueue()       : send files one by one from the queue.
+ *  - sendFile()           : send a single file with offer/accept handshake.
+ *  - verifyAndComplete()  : wait for receiver's hash verdict.
  */
-import { WebSocketServer, WebSocket } from 'ws'
-import { app } from 'electron'
-import * as fs from 'fs'
-import * as path from 'path'
-import * as crypto from 'crypto'
 
-export type Peer = { name: string; platform: string }
-export type TransferMeta = { name: string; size: number; isSending: boolean; verified?: boolean; resumed?: number }
+import { app } from 'electron';
+import { WebSocketServer, WebSocket } from 'ws';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as crypto from 'crypto';
+import { TransferQueue, type QueuedFile } from './transferQueue';
 
-const PING_INTERVAL_MS = 3000
-const PONG_TIMEOUT_MS = 10000
-const CHUNK_SIZE = 4 * 1024 * 1024
-const MIN_WORKERS = 2
-const START_WORKERS = 4
-const MAX_WORKERS = 8
-const VERIFY_TIMEOUT_MS = 20000
+export type Peer = { name: string; platform: string };
+export type TransferMeta = { id: string; name: string; size: number; isSending: boolean; verified?: boolean; resumed?: number };
+
+const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB chunks
+const VERIFY_TIMEOUT = 20000; // 20 seconds
 
 export class TransportServer {
-  private wss: WebSocketServer
-  private peerWs: WebSocket | null = null
-  private peer: Peer | null = null
-  private selfName: string
-  private pingTimer: NodeJS.Timeout | null = null
-  private lastPong = 0
+  private server: WebSocketServer;
+  private peer: WebSocket | null = null;
+  private peerInfo: Peer | null = null;
+  private pingTimer: NodeJS.Timeout | null = null;
+  private lastPong: number = Date.now();
 
-  // receiving state
-  private recvFd: number | null = null
-  private recvPartPath: string | null = null
-  private recvFinalName: string | null = null
-  private recvSize = 0
-  private recvTransferId: string | null = null
-  private recvSaveDir: string | null = null
-  private recvExpectedHash: string | null = null
-  private recvReceived = new Set<number>()
-  private pendingIncoming: { name: string; size: number; transferId: string; fileHash: string } | null = null
+  private queue = new TransferQueue();
+  private isProcessing = false;
+  private cancelRequested = false;
+  private cancelFileId: string | null = null;
 
-  // sending state
-  private pendingFilePath: string | null = null
-  private resumeState: { transferId: string } | null = null
-  private ackResolvers = new Map<number, () => void>()
-  private resendQueue: number[] = []
-  private sendAborted = false
-  private verifyResolver: ((ok: boolean) => void) | null = null
+  private incomingOffer: { id: string; name: string; size: number; hash: string; chunkSize: number; chunkCount: number } | null = null;
+  private activeRecv: { id: string; fd: number; size: number; expected: Set<number>; received: Set<number> } | null = null;
 
-  // UI state
-  private currentTransfer: TransferMeta | null = null
-  private lastTransfer: TransferMeta | null = null
+  // Event callbacks
+  onPeerConnected?: (peer: Peer) => void;
+  onPeerDisconnected?: () => void;
+  onSendAccepted?: (id: string) => void;
+  onSendDeclined?: (id: string) => void;
+  onFileTransferStart?: (meta: TransferMeta) => void;
+  onFileProgress?: (id: string, bytes: number, isSending: boolean) => void;
+  onFileDone?: (id: string, name: string, isSending: boolean, verified: boolean) => void;
+  onIncomingOffer?: (id: string, name: string, size: number) => void;
 
-  onPeerConnected?: (peer: Peer) => void
-  onPeerDisconnected?: () => void
-  onIncomingOffer?: (name: string, size: number) => void
-  onSendAccepted?: () => void
-  onSendDeclined?: () => void
-  onFileTransferStart?: (meta: TransferMeta) => void
-  onFileProgress?: (bytes: number, isSending: boolean) => void
-  onFileDone?: (name: string, isSending: boolean, verified: boolean) => void
-
-  constructor(port: number, selfName: string) {
-    this.selfName = selfName
-    this.wss = new WebSocketServer({ host: '0.0.0.0', port })
-    this.wss.on('connection', (ws) => this.handle(ws))
-    this.wss.on('error', (err) => console.error('[transport] server error', err))
-    console.log(`[transport] listening on 0.0.0.0:${port}`)
+  constructor(port: number = 8431) {
+    this.server = new WebSocketServer({ port, host: '0.0.0.0' });
+    console.log(`[transport] listening on 0.0.0.0:${port}`);
+    this.server.on('connection', (ws) => this.handleConnection(ws));
   }
 
-  private sendSidecarPath(): string {
-    return path.join(app.getPath('userData'), 'flova-pending-send.json')
-  }
-
-  private recvDir(): string {
-    const d = path.join(app.getPath('downloads'), 'Flova')
-    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true })
-    return d
-  }
-
-  private async hashFile(p: string): Promise<string> {
-    const h = crypto.createHash('sha256')
-    const fd = fs.openSync(p, 'r')
-    const buf = Buffer.alloc(4 * 1024 * 1024)
-    try {
-      let n = fs.readSync(fd, buf, 0, buf.length, null)
-      while (n > 0) {
-        h.update(buf.subarray(0, n))
-        n = fs.readSync(fd, buf, 0, buf.length, null)
-      }
-    } finally {
-      fs.closeSync(fd)
+  enqueueFile(filePath: string, name: string, size: number): string {
+    const id = this.queue.enqueue(filePath, name, size);
+    if (!this.isProcessing) {
+      this.processQueue();
     }
-    return h.digest('hex')
+    return id;
   }
 
-  // sender waits for the receiver's hash verdict (timeout = assume ok)
-  private awaitVerify(): Promise<boolean> {
-    return new Promise<boolean>((resolve) => {
-      this.verifyResolver = resolve
-      setTimeout(() => {
-        if (this.verifyResolver === resolve) {
-          this.verifyResolver = null
-          console.warn('[transport] verify-result timeout, assuming ok')
-          resolve(true)
-        }
-      }, VERIFY_TIMEOUT_MS)
-    })
+  cancelTransfer(id?: string): boolean {
+    if (id) {
+      return this.queue.cancel(id);
+    } else {
+      this.cancelRequested = true;
+      return true;
+    }
   }
 
-  private handle(ws: WebSocket): void {
-    if (this.peerWs) { ws.close(1013, 'already connected'); return }
+  private async processQueue() {
+    if (this.isProcessing || !this.peer) return;
+    this.isProcessing = true;
 
-    ws.on('message', (data, isBinary) => {
-      if (isBinary) { this.handleBinaryFrame(data as Buffer); return }
-      try {
-        const msg = JSON.parse(data.toString())
-        if (msg?.type === 'hello') {
-          this.peerWs = ws
-          this.peer = { name: String(msg.name ?? 'Phone'), platform: String(msg.platform ?? 'mobile') }
-          this.lastPong = Date.now()
-          ws.send(JSON.stringify({ type: 'hello-ack', name: this.selfName, platform: 'desktop' }))
-          this.startHb()
-          this.onPeerConnected?.(this.peer)
-          this.maybeOfferResume()
-        } else if (msg?.type === 'ping') {
-          ws.send(JSON.stringify({ type: 'pong' }))
-        } else if (msg?.type === 'pong') {
-          this.lastPong = Date.now()
-        } else if (msg?.type === 'verify-result') {
-          const r = this.verifyResolver
-          this.verifyResolver = null
-          if (r) r(msg.ok === true)
-        } else if (msg?.type === 'chunk-ack') {
-          const i = Number(msg.i)
-          const resolve = this.ackResolvers.get(i)
-          if (resolve) { this.ackResolvers.delete(i); resolve() }
-        } else if (msg?.type === 'chunk-nack') {
-          const i = Number(msg.i)
-          if (!this.resendQueue.includes(i)) this.resendQueue.push(i)
-        } else if (msg?.type === 'file-offer') {
-          this.pendingIncoming = {
-            name: path.basename(String(msg.name)),
-            size: Number(msg.size),
-            transferId: String(msg.transferId ?? 't0'),
-            fileHash: String(msg.fileHash ?? ''),
-          }
-          this.onIncomingOffer?.(this.pendingIncoming.name, this.pendingIncoming.size)
-        } else if (msg?.type === 'file-accept') {
-          if (this.pendingFilePath) {
-            const fp = this.pendingFilePath
-            this.pendingFilePath = null
-            this.startFileStream(fp, new Set<number>(), 0)
-          }
-        } else if (msg?.type === 'file-decline') {
-          this.pendingFilePath = null
-          this.currentTransfer = null
-          this.onSendDeclined?.()
-        } else if (msg?.type === 'resume-offer') {
-          this.handleResumeOffer(msg)
-        } else if (msg?.type === 'resume-accept') {
-          const received = Array.isArray(msg.received) ? (msg.received as number[]) : []
-          if (this.resumeState && this.pendingFilePath) {
-            const skip = new Set(received)
-            let resumed = 0
-            const size = fs.statSync(this.pendingFilePath).size
-            for (const i of skip) {
-              const off = i * CHUNK_SIZE
-              resumed += Math.min(CHUNK_SIZE, size - off)
-            }
-            const fp = this.pendingFilePath
-            this.pendingFilePath = null
-            this.startFileStream(fp, skip, resumed)
-          }
-        } else if (msg?.type === 'resume-decline') {
-          this.clearSendSidecar()
-          this.resumeState = null
-          this.pendingFilePath = null
-        } else if (msg?.type === 'file-start') {
-          // segments follow; write sink already open
-        } else if (msg?.type === 'file-end') {
-          this.finishIncomingFile()
-        }
-      } catch (err) {
-        console.warn('[transport] bad json frame', err)
+    let file = this.queue.dequeue();
+    while (file && this.peer) {
+      if (this.cancelRequested) {
+        this.queue.complete(file.id, false);
+        this.cancelRequested = false;
+        break;
       }
-    })
+
+      const success = await this.sendFile(file);
+      this.queue.complete(file.id, success);
+
+      if (this.cancelRequested) {
+        this.cancelRequested = false;
+        break;
+      }
+
+      file = this.queue.dequeue();
+    }
+
+    this.isProcessing = false;
+  }
+
+  private async sendFile(file: QueuedFile): Promise<boolean> {
+    if (!this.peer) return false;
+
+    try {
+      // Hash the file
+      const hash = await this.hashFile(file.path);
+      const chunkCount = Math.ceil(file.size / CHUNK_SIZE);
+
+      // Send offer
+      this.peer.send(JSON.stringify({
+        type: 'file-offer',
+        id: file.id,
+        name: file.name,
+        size: file.size,
+        hash,
+        chunkSize: CHUNK_SIZE,
+        chunkCount,
+      }));
+
+      // Wait for accept/decline
+      const response = await this.waitForMessage(['file-accept', 'file-decline']);
+      if (response.type === 'file-decline') {
+        this.onSendDeclined?.(file.id);
+        return false;
+      }
+
+      this.onSendAccepted?.(file.id);
+      this.onFileTransferStart?.({ id: file.id, name: file.name, size: file.size, isSending: true });
+
+      // Stream the file
+      const fd = fs.openSync(file.path, 'r');
+      let bytesSent = 0;
+
+      for (let i = 0; i < chunkCount; i++) {
+        if (this.cancelRequested || this.cancelFileId === file.id) {
+          fs.closeSync(fd);
+          this.cancelFileId = null;
+          return false;
+        }
+
+        const offset = i * CHUNK_SIZE;
+        const chunkSize = Math.min(CHUNK_SIZE, file.size - offset);
+        const chunk = Buffer.alloc(chunkSize);
+        fs.readSync(fd, chunk, 0, chunkSize, offset);
+
+        // Calculate chunk hash
+        const chunkHash = crypto.createHash('sha256').update(chunk).digest('hex');
+
+        // Send chunk with header
+        const header = {
+          type: 'chunk',
+          id: file.id,
+          index: i,
+          hash: chunkHash,
+        };
+        const headerStr = JSON.stringify(header);
+        const headerBuf = Buffer.from(headerStr, 'utf-8');
+        const headerLenBuf = Buffer.alloc(4);
+        headerLenBuf.writeUInt32BE(headerBuf.length, 0);
+
+        this.peer.send(Buffer.concat([headerLenBuf, headerBuf, chunk]));
+        bytesSent += chunkSize;
+
+        const progress = (bytesSent / file.size) * 100;
+        this.queue.updateProgress(file.id, progress);
+        this.onFileProgress?.(file.id, chunkSize, true);
+
+        // Wait for chunk ack
+        await this.waitForMessage(['chunk-ack']);
+      }
+
+      fs.closeSync(fd);
+
+      // Send end marker
+      this.peer.send(JSON.stringify({ type: 'file-end', id: file.id }));
+
+      // Wait for verify result
+      const verified = await this.verifyAndComplete(file.id);
+      this.onFileDone?.(file.id, file.name, true, verified);
+
+      return verified;
+    } catch (err) {
+      console.error('[transport] send failed:', err);
+      return false;
+    }
+  }
+
+  private async verifyAndComplete(id: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        console.warn(`[transport] verify timeout for ${id}, assuming success`);
+        resolve(true);
+      }, VERIFY_TIMEOUT);
+
+      const checkMessage = (msg: any) => {
+        if (msg.type === 'verify-result' && msg.id === id) {
+          clearTimeout(timeout);
+          this.messageHandlers = this.messageHandlers.filter((h) => h !== checkMessage);
+          resolve(msg.ok === true);
+        }
+      };
+
+      this.messageHandlers.push(checkMessage);
+    });
+  }
+
+  private messageHandlers: ((msg: any) => void)[] = [];
+
+  private waitForMessage(types: string[]): Promise<any> {
+    return new Promise((resolve) => {
+      const handler = (msg: any) => {
+        if (types.includes(msg.type)) {
+          this.messageHandlers = this.messageHandlers.filter((h) => h !== handler);
+          resolve(msg);
+        }
+      };
+      this.messageHandlers.push(handler);
+    });
+  }
+
+  private async hashFile(filePath: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const hash = crypto.createHash('sha256');
+      const stream = fs.createReadStream(filePath);
+      stream.on('data', (chunk) => hash.update(chunk));
+      stream.on('end', () => resolve(hash.digest('hex')));
+      stream.on('error', reject);
+    });
+  }
+
+  private handleConnection(ws: WebSocket) {
+    this.peer = ws;
+    this.lastPong = Date.now();
+
+    ws.on('message', (data) => {
+      if (Buffer.isBuffer(data)) {
+        this.handleBinaryFrame(data);
+      } else {
+        try {
+          const msg = JSON.parse(data.toString());
+          this.handleMessage(msg);
+        } catch (err) {
+          console.error('[transport] invalid JSON:', err);
+        }
+      }
+    });
 
     ws.on('close', () => {
-      if (this.peerWs === ws) {
-        this.stopHb(); this.peerWs = null; this.peer = null
-        this.sendAborted = true
-        for (const resolve of this.ackResolvers.values()) resolve()
-        this.ackResolvers.clear()
-        if (this.verifyResolver) { const r = this.verifyResolver; this.verifyResolver = null; r(false) }
-        if (this.recvFd != null) { try { fs.closeSync(this.recvFd) } catch {} this.recvFd = null }
-        this.writeSidecar()
-        this.currentTransfer = null
-        this.onPeerDisconnected?.()
-      }
-    })
-    ws.on('error', (err) => console.warn('[transport] peer error', err))
+      this.peer = null;
+      this.peerInfo = null;
+      this.stopPing();
+      this.onPeerDisconnected?.();
+    });
+
+    this.startPing();
   }
 
-  // ---------- sending ----------
-  async offerFile(filePath: string): Promise<void> {
-    if (!this.peerWs) return
-    this.pendingFilePath = filePath
-    const stats = fs.statSync(filePath)
-    const fileHash = await this.hashFile(filePath)
-    const transferId = `t${Date.now()}`
-    const meta: TransferMeta = { name: path.basename(filePath), size: stats.size, isSending: true }
-    this.currentTransfer = meta
-    this.lastTransfer = meta
-    fs.writeFileSync(this.sendSidecarPath(), JSON.stringify({
-      transferId, filePath, name: meta.name, size: stats.size,
-      chunkSize: CHUNK_SIZE, chunkCount: Math.ceil(stats.size / CHUNK_SIZE), fileHash,
-    }))
-    this.peerWs.send(JSON.stringify({
-      type: 'file-offer', transferId, name: meta.name, size: stats.size,
-      chunkSize: CHUNK_SIZE, chunkCount: Math.ceil(stats.size / CHUNK_SIZE), fileHash,
-    }))
+  private handleMessage(msg: any) {
+    // Dispatch to waiting handlers
+    this.messageHandlers.forEach((h) => h(msg));
+
+    if (msg.type === 'hello') {
+      this.peerInfo = { name: msg.name, platform: msg.platform };
+      this.peer?.send(JSON.stringify({ type: 'hello-ack' }));
+      this.onPeerConnected?.(this.peerInfo);
+      this.processQueue();
+    } else if (msg.type === 'pong') {
+      this.lastPong = Date.now();
+    } else if (msg.type === 'file-offer') {
+      this.incomingOffer = {
+        id: msg.id,
+        name: msg.name,
+        size: msg.size,
+        hash: msg.hash,
+        chunkSize: msg.chunkSize,
+        chunkCount: msg.chunkCount,
+      };
+      this.onIncomingOffer?.(msg.id, msg.name, msg.size);
+    } else if (msg.type === 'file-end') {
+      this.finishIncoming(msg.id);
+    }
   }
 
-  private clearSendSidecar(): void {
-    try { fs.unlinkSync(this.sendSidecarPath()) } catch {}
-  }
+  private handleBinaryFrame(data: Buffer) {
+    if (!this.activeRecv) return;
 
-  private maybeOfferResume(): void {
-    const p = this.sendSidecarPath()
-    if (!fs.existsSync(p)) return
     try {
-      const s = JSON.parse(fs.readFileSync(p, 'utf8'))
-      if (!fs.existsSync(s.filePath) || fs.statSync(s.filePath).size !== s.size) {
-        this.clearSendSidecar(); return
-      }
-      this.pendingFilePath = s.filePath
-      this.resumeState = { transferId: s.transferId }
-      this.peerWs?.send(JSON.stringify({
-        type: 'resume-offer', transferId: s.transferId, name: s.name, size: s.size,
-        chunkSize: s.chunkSize, chunkCount: s.chunkCount, fileHash: s.fileHash,
-      }))
-    } catch {
-      this.clearSendSidecar()
-    }
-  }
+      const headerLen = data.readUInt32BE(0);
+      const headerStr = data.subarray(4, 4 + headerLen).toString('utf-8');
+      const header = JSON.parse(headerStr);
+      const chunk = data.subarray(4 + headerLen);
 
-  private async startFileStream(filePath: string, skip: Set<number>, resumedBytes: number): Promise<void> {
-    if (!this.peerWs) return
-    const size = fs.statSync(filePath).size
-    const name = path.basename(filePath)
-    const count = size === 0 ? 0 : Math.ceil(size / CHUNK_SIZE)
-    this.sendAborted = false
-    this.resendQueue = []
-    this.onSendAccepted?.()
-    this.onFileTransferStart?.({ name, size, isSending: true, resumed: resumedBytes })
-    this.peerWs.send(JSON.stringify({ type: 'file-start', name, size }))
+      if (header.type !== 'chunk' || header.id !== this.activeRecv.id) return;
 
-    const missing: number[] = []
-    for (let i = 0; i < count; i++) if (!skip.has(i)) missing.push(i)
-    let queuePos = 0
-
-    const fd = fs.openSync(filePath, 'r')
-    const self = this
-    let activeWorkers = 0
-    let targetWorkers = missing.length === 0 ? 1 : Math.min(START_WORKERS, missing.length)
-    let ackedBytes = resumedBytes
-    let lastSampleBytes = resumedBytes
-    let lastSampleTime = Date.now()
-    let lastRate = 0
-    const workers: Promise<void>[] = []
-
-    function workerLoop(): Promise<void> {
-      activeWorkers++
-      return (async () => {
-        try {
-          while (!self.sendAborted && self.peerWs) {
-            const i = self.resendQueue.length > 0
-              ? self.resendQueue.shift()!
-              : (queuePos < missing.length ? missing[queuePos++] : -1)
-            if (i === -1) break
-            if (activeWorkers > targetWorkers && self.resendQueue.length === 0) break
-            const offset = i * CHUNK_SIZE
-            const len = Math.min(CHUNK_SIZE, size - offset)
-            const buf = Buffer.alloc(len)
-            fs.readSync(fd, buf, 0, len, offset)
-            const segHash = crypto.createHash('sha256').update(buf).digest('hex')
-
-            const header = Buffer.from(JSON.stringify({ i, o: offset, l: len, h: segHash }), 'utf8')
-            const prefix = Buffer.alloc(4)
-            prefix.writeUInt32BE(header.length, 0)
-
-            const ackPromise = new Promise<void>((resolve) => { self.ackResolvers.set(i, resolve) })
-            self.peerWs.send(Buffer.concat([prefix, header, buf]))
-            await ackPromise
-            if (self.sendAborted || !self.peerWs) break
-            ackedBytes += len
-            self.onFileProgress?.(len, true)
-          }
-        } finally {
-          activeWorkers--
-        }
-      })()
-    }
-
-    const monitor = setInterval(() => {
-      const now = Date.now()
-      const dt = (now - lastSampleTime) / 1000
-      if (dt <= 0) return
-      const rate = (ackedBytes - lastSampleBytes) / dt
-      lastSampleBytes = ackedBytes
-      lastSampleTime = now
-      if (lastRate > 0 && rate > 0) {
-        if (rate > lastRate * 1.05 && targetWorkers < MAX_WORKERS) {
-          targetWorkers++
-          workers.push(workerLoop())
-        } else if (rate < lastRate * 0.7 && targetWorkers > MIN_WORKERS) {
-          targetWorkers = Math.max(MIN_WORKERS, Math.floor(targetWorkers / 2))
-        }
-      }
-      lastRate = rate
-    }, 2000)
-
-    for (let w = 0; w < targetWorkers; w++) workers.push(workerLoop())
-
-    let awaited = 0
-    while (awaited < workers.length) {
-      const batch = workers.slice(awaited)
-      awaited = workers.length
-      await Promise.all(batch)
-    }
-    clearInterval(monitor)
-    while (awaited < workers.length) {
-      const batch = workers.slice(awaited)
-      awaited = workers.length
-      await Promise.all(batch)
-    }
-
-    fs.closeSync(fd)
-    if (!this.sendAborted && this.peerWs) {
-      this.peerWs.send(JSON.stringify({ type: 'file-end' }))
-      // wait for the receiver's hash verdict before declaring success
-      const verified = await this.awaitVerify()
-      this.clearSendSidecar()
-      this.onFileDone?.(name, true, verified)
-    }
-    this.resumeState = null
-    this.currentTransfer = null
-  }
-
-  // ---------- receiving ----------
-  getIncomingOffer() {
-    return this.pendingIncoming ? { name: this.pendingIncoming.name, size: this.pendingIncoming.size } : null
-  }
-
-  acceptIncoming(): void {
-    if (!this.pendingIncoming || !this.peerWs) return
-    const { name, size, transferId, fileHash } = this.pendingIncoming
-    this.pendingIncoming = null
-
-    const saveDir = this.recvDir()
-    // sweep orphaned sidecars/.part files from dead transfers (snapshot first)
-    for (const f of fs.readdirSync(saveDir)) {
-      if (f.endsWith('.flova.json') && !f.includes(transferId)) {
-        try {
-          const sc = JSON.parse(fs.readFileSync(path.join(saveDir, f), 'utf8'))
-          if (sc?.name) try { fs.unlinkSync(path.join(saveDir, `${sc.name}.part`)) } catch {}
-          fs.unlinkSync(path.join(saveDir, f))
-        } catch {}
-      }
-    }
-
-    if (this.recvFd != null) { try { fs.closeSync(this.recvFd) } catch {} this.recvFd = null }
-
-    const partPath = path.join(saveDir, `${name}.part`)
-    this.recvFd = fs.openSync(partPath, 'w')
-    fs.ftruncateSync(this.recvFd, size)
-    this.recvPartPath = partPath
-    this.recvFinalName = name
-    this.recvSize = size
-    this.recvTransferId = transferId
-    this.recvSaveDir = saveDir
-    this.recvExpectedHash = fileHash || null
-    this.recvReceived = new Set<number>()
-
-    this.peerWs.send(JSON.stringify({ type: 'file-accept' }))
-    const meta: TransferMeta = { name, size, isSending: false, resumed: 0 }
-    this.currentTransfer = meta
-    this.lastTransfer = meta
-    this.onFileTransferStart?.(meta)
-  }
-
-  declineIncoming(): void {
-    if (!this.pendingIncoming || !this.peerWs) return
-    this.pendingIncoming = null
-    this.peerWs.send(JSON.stringify({ type: 'file-decline' }))
-  }
-
-  private handleResumeOffer(msg: any): void {
-    const transferId = String(msg.transferId ?? '')
-    const size = Number(msg.size)
-    const saveDir = this.recvDir()
-    const sidecar = path.join(saveDir, `.${transferId}.flova.json`)
-    const name = path.basename(String(msg.name))
-    const partPath = path.join(saveDir, `${name}.part`)
-    if (!transferId || !fs.existsSync(sidecar) || !fs.existsSync(partPath)) {
-      this.peerWs?.send(JSON.stringify({ type: 'resume-decline', transferId }))
-      return
-    }
-    try {
-      const sc = JSON.parse(fs.readFileSync(sidecar, 'utf8'))
-      if (sc.size !== size) throw new Error('size mismatch')
-      const received: number[] = Array.isArray(sc.received) ? sc.received : []
-      if (this.recvFd != null) { try { fs.closeSync(this.recvFd) } catch {} this.recvFd = null }
-      this.recvFd = fs.openSync(partPath, 'r+')
-      this.recvPartPath = partPath
-      this.recvFinalName = name
-      this.recvSize = size
-      this.recvTransferId = transferId
-      this.recvSaveDir = saveDir
-      this.recvExpectedHash = String(msg.fileHash ?? '') || null
-      this.recvReceived = new Set(received)
-      let resumed = 0
-      for (const i of this.recvReceived) {
-        const off = i * CHUNK_SIZE
-        resumed += Math.min(CHUNK_SIZE, size - off)
-      }
-      this.peerWs?.send(JSON.stringify({ type: 'resume-accept', transferId, received: Array.from(this.recvReceived) }))
-      const meta: TransferMeta = { name, size, isSending: false, resumed }
-      this.currentTransfer = meta
-      this.lastTransfer = meta
-      this.onFileTransferStart?.(meta)
-    } catch {
-      try { fs.unlinkSync(sidecar) } catch {}
-      this.peerWs?.send(JSON.stringify({ type: 'resume-decline', transferId }))
-    }
-  }
-
-  private handleBinaryFrame(data: Buffer): void {
-    if (this.recvFd == null) return
-    try {
-      const headerLen = data.readUInt32BE(0)
-      const header = JSON.parse(data.subarray(4, 4 + headerLen).toString('utf8'))
-      const payload = data.subarray(4 + headerLen)
-
-      const actual = crypto.createHash('sha256').update(payload).digest('hex')
-      if (header.h && actual !== header.h) {
-        this.peerWs?.send(JSON.stringify({ type: 'chunk-nack', i: header.i }))
-        return
+      // Verify chunk hash
+      const chunkHash = crypto.createHash('sha256').update(chunk).digest('hex');
+      if (chunkHash !== header.hash) {
+        this.peer?.send(JSON.stringify({ type: 'chunk-nack', id: header.id, index: header.index }));
+        return;
       }
 
-      fs.writeSync(this.recvFd, payload, 0, payload.length, Number(header.o))
-      this.recvReceived.add(Number(header.i))
-      if (this.recvReceived.size % 25 === 0) this.writeSidecar()
-      this.peerWs?.send(JSON.stringify({ type: 'chunk-ack', i: header.i }))
-      this.onFileProgress?.(payload.length, false)
+      // Write chunk at offset
+      const offset = header.index * CHUNK_SIZE;
+      fs.writeSync(this.activeRecv.fd, chunk, 0, chunk.length, offset);
+
+      this.activeRecv.received.add(header.index);
+      this.peer?.send(JSON.stringify({ type: 'chunk-ack', id: header.id, index: header.index }));
+      this.onFileProgress?.(header.id, chunk.length, false);
     } catch (err) {
-      console.warn('[transport] bad binary frame', err)
+      console.error('[transport] binary frame error:', err);
     }
   }
 
-  private writeSidecar(): void {
-    if (!this.recvSaveDir || !this.recvTransferId) return
+  acceptIncoming(id: string): boolean {
+    if (!this.incomingOffer || this.incomingOffer.id !== id) return false;
+
     try {
-      const sidecar = path.join(this.recvSaveDir, `.${this.recvTransferId}.flova.json`)
-      fs.writeFileSync(sidecar, JSON.stringify({
-        name: this.recvFinalName, size: this.recvSize,
-        chunkSize: CHUNK_SIZE, received: Array.from(this.recvReceived),
-      }))
-    } catch {}
+      const downloadDir = path.join(app.getPath('downloads'), 'Flova');
+      if (!fs.existsSync(downloadDir)) {
+        fs.mkdirSync(downloadDir, { recursive: true });
+      }
+
+      const partPath = path.join(downloadDir, `${this.incomingOffer.name}.part`);
+      const fd = fs.openSync(partPath, 'w');
+      fs.ftruncateSync(fd, this.incomingOffer.size);
+
+      this.activeRecv = {
+        id,
+        fd,
+        size: this.incomingOffer.size,
+        expected: new Set(Array.from({ length: this.incomingOffer.chunkCount }, (_, i) => i)),
+        received: new Set(),
+      };
+
+      this.peer?.send(JSON.stringify({ type: 'file-accept', id }));
+      this.onFileTransferStart?.({ id, name: this.incomingOffer.name, size: this.incomingOffer.size, isSending: false });
+      return true;
+    } catch (err) {
+      console.error('[transport] accept failed:', err);
+      return false;
+    }
   }
 
-  private finishIncomingFile(): void {
-    if (this.recvFd != null) { try { fs.closeSync(this.recvFd) } catch {} this.recvFd = null }
-    if (!this.recvPartPath || !this.recvSaveDir || !this.recvFinalName) return
-    const partPath = this.recvPartPath
-    const saveDir = this.recvSaveDir
-    const finalName = this.recvFinalName
-    const expected = this.recvExpectedHash
-
-    ;(async () => {
-      let verified = true
-      if (expected) {
-        const actual = await this.hashFile(partPath)
-        verified = actual === expected
-      }
-      // tell the sender the truth before doing anything else
-      this.peerWs?.send(JSON.stringify({ type: 'verify-result', ok: verified }))
-      if (!verified) {
-        try { fs.unlinkSync(partPath) } catch {}
-        this.cleanupRecvState()
-        this.onFileDone?.(finalName, false, false)
-        return
-      }
-      let finalPath = path.join(saveDir, finalName)
-      let counter = 1
-      while (fs.existsSync(finalPath)) {
-        const ext = path.extname(finalName)
-        const base = path.basename(finalName, ext)
-        finalPath = path.join(saveDir, `${base}_(${counter})${ext}`)
-        counter++
-      }
-      try {
-        fs.renameSync(partPath, finalPath)
-        if (this.recvTransferId) {
-          const sidecar = path.join(saveDir, `.${this.recvTransferId}.flova.json`)
-          if (fs.existsSync(sidecar)) fs.unlinkSync(sidecar)
-        }
-        this.onFileDone?.(path.basename(finalPath), false, true)
-      } catch (err) {
-        console.warn('[transport] rename failed', err)
-      }
-      this.cleanupRecvState()
-    })()
+  declineIncoming(id: string): void {
+    if (this.incomingOffer?.id === id) {
+      this.peer?.send(JSON.stringify({ type: 'file-decline', id }));
+      this.incomingOffer = null;
+    }
   }
 
-  private cleanupRecvState(): void {
-    this.recvPartPath = null; this.recvFinalName = null; this.recvTransferId = null
-    this.recvExpectedHash = null
-    this.currentTransfer = null
+  private finishIncoming(id: string) {
+    if (!this.activeRecv || this.activeRecv.id !== id) return;
+
+    const { fd, size, expected, received } = this.activeRecv;
+    fs.closeSync(fd);
+
+    const downloadDir = path.join(app.getPath('downloads'), 'Flova');
+    const partPath = path.join(downloadDir, `${this.incomingOffer!.name}.part`);
+    const finalPath = path.join(downloadDir, this.incomingOffer!.name);
+
+    if (received.size === expected.size) {
+      fs.renameSync(partPath, finalPath);
+      const verified = this.verifyFileSync(finalPath, this.incomingOffer!.hash);
+      this.peer?.send(JSON.stringify({ type: 'verify-result', id, ok: verified }));
+      this.onFileDone?.(id, this.incomingOffer!.name, false, verified);
+    } else {
+      fs.unlinkSync(partPath);
+      this.peer?.send(JSON.stringify({ type: 'verify-result', id, ok: false }));
+      this.onFileDone?.(id, this.incomingOffer!.name, false, false);
+    }
+
+    this.activeRecv = null;
+    this.incomingOffer = null;
   }
 
-  getCurrentTransfer() { return this.currentTransfer }
-  getLastTransfer() { return this.lastTransfer }
+  private verifyFileSync(filePath: string, expectedHash: string): boolean {
+    try {
+      const hash = crypto.createHash('sha256');
+      const data = fs.readFileSync(filePath);
+      hash.update(data);
+      return hash.digest('hex') === expectedHash;
+    } catch {
+      return false;
+    }
+  }
 
-  private startHb(): void {
-    this.stopHb()
+  private startPing() {
     this.pingTimer = setInterval(() => {
-      if (!this.peerWs) return
-      try { this.peerWs.send(JSON.stringify({ type: 'ping' })) } catch {}
-      if (Date.now() - this.lastPong > PONG_TIMEOUT_MS) {
-        try { this.peerWs?.close(1001, 'pong timeout') } catch {}
+      if (Date.now() - this.lastPong > 15000) {
+        console.warn('[transport] peer timeout, closing');
+        this.peer?.close();
+        return;
       }
-    }, PING_INTERVAL_MS)
+      this.peer?.send(JSON.stringify({ type: 'ping' }));
+    }, 5000);
   }
-  private stopHb(): void { if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null } }
-  getPort(): number { const addr = this.wss.address(); return typeof addr === 'object' && addr ? addr.port : 0 }
+
+  private stopPing() {
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+  }
+
+  getQueueStats() {
+    return this.queue.getStats();
+  }
+
+  getQueueFiles() {
+    return this.queue.getAll();
+  }
+
+  shutdown() {
+    this.stopPing();
+    this.server.close();
+  }
 }
