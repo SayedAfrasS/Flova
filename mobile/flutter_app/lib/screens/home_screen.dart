@@ -1,12 +1,11 @@
 /// WORKFLOW OF THIS FILE:
-/// 1. Mobile home shell: owns the bottom navigation bar and connection overlay.
-/// 2. Overlay states: reconnecting / error / disconnected show retry actions;
-///    paired-with-unfinished-transfer shows "Checking transfer..." briefly.
-/// 3. RESUME: a resume event (either direction) pushes the Progress screen,
-///    which opens at the interrupted percentage. If the resume handshake
-///    finished BEFORE this screen mounted (app relaunch case), the stashed
-///    event is consumed in initState and the Progress screen still opens.
-/// 4. Fresh incoming offers open the Receive screen as before.
+/// 1. Mobile home shell: bottom navigation + connection overlay.
+/// 2. Incoming offers push ONE ReceiveScreen (guarded by _receiveOpen so a
+///    duplicate event can never stack a second screen on top).
+/// 3. RESUME: resume events push the Progress screen; a resume that finished
+///    before mount is consumed from the transport's stash in initState.
+/// 4. Overlay states: reconnecting / lost / "Checking transfer..." while the
+///    resume handshake runs right after pairing.
 import 'dart:async';
 import 'package:flutter/material.dart';
 import '../core/flova_mark.dart';
@@ -34,6 +33,7 @@ class _HomeScreenState extends State<HomeScreen> {
   TransportState _state = TransportState.paired;
   bool _checkingResume = false;
   bool _resumePushed = false;
+  bool _receiveOpen = false;
   StreamSubscription<TransportState>? _stateSub;
   StreamSubscription<FileEvent>? _fileSub;
   Timer? _checkingTimer;
@@ -42,7 +42,6 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
 
-    // RESUME-RELAUNCH: consume a resume event that fired before we mounted
     final stashed = widget.transport.takeLastResumeEvent();
     if (stashed != null) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -85,8 +84,13 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       if (event.isOffer) {
         setState(() => _checkingResume = false);
+        if (_receiveOpen) return; // never stack duplicate receive screens
+        _receiveOpen = true;
         Navigator.of(context).push(MaterialPageRoute(
-          builder: (_) => ReceiveScreen(transport: widget.transport),
+          builder: (_) => ReceiveScreen(
+            transport: widget.transport,
+            onDismissed: () { if (mounted) setState(() => _receiveOpen = false); },
+          ),
         ));
       } else if (event.isResume) {
         setState(() => _checkingResume = false);
@@ -106,7 +110,10 @@ class _HomeScreenState extends State<HomeScreen> {
       } else if (event.isDone) {
         _resumePushed = false;
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Saved: ${event.name}'), duration: const Duration(seconds: 3)),
+          SnackBar(
+            content: Text(event.ok ? 'Saved: ${event.name}' : 'Failed: ${event.name} arrived damaged'),
+            duration: const Duration(seconds: 3),
+          ),
         );
       }
     });
@@ -184,12 +191,9 @@ class _HomeScreenState extends State<HomeScreen> {
     } else if (isReconnecting) {
       title = 'Trying to reconnect…';
       subtitle = 'Attempting to reach ${widget.peerName} again.';
-    } else if (_state == TransportState.error || _state == TransportState.disconnected) {
+    } else {
       title = 'Connection lost';
       subtitle = 'Could not reach ${widget.peerName}.';
-    } else {
-      title = '';
-      subtitle = '';
     }
 
     return Container(
@@ -265,7 +269,16 @@ class _HomeScreenState extends State<HomeScreen> {
             width: double.infinity,
             child: OutlinedButton.icon(
               onPressed: isConnected
-                  ? () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => ReceiveScreen(transport: widget.transport)))
+                  ? () {
+                      if (_receiveOpen) return;
+                      _receiveOpen = true;
+                      Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) => ReceiveScreen(
+                          transport: widget.transport,
+                          onDismissed: () { if (mounted) setState(() => _receiveOpen = false); },
+                        ),
+                      ));
+                    }
                   : null,
               icon: const Icon(Icons.download),
               label: const Text('Receive a file'),
