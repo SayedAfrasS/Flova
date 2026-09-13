@@ -69,7 +69,7 @@ export class TransportServer {
 
   onPeerConnected?: (peer: Peer) => void
   onPeerDisconnected?: () => void
-  onIncomingOffer?: (name: string; size: number) => void
+  onIncomingOffer?: (name: string, size: number) => void
   onSendAccepted?: () => void
   onSendDeclined?: () => void
   onFileTransferStart?: (meta: TransferMeta) => void
