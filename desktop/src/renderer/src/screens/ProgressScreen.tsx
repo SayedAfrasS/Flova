@@ -2,11 +2,9 @@
  * WORKFLOW OF THIS FILE:
  * 1. Shows live progress for the active transfer (sending or receiving).
  * 2. Bytes accumulate in refs; speed math runs in the IPC event handler.
- * 3. RESUME: when a transfer start event carries "resumed" bytes (a transfer
- *    continuing after reconnect), the counters seed from that value so the
- *    ring opens at e.g. 61% and climbs from there instead of restarting.
- * 4. While receiving, at 100% the subtitle shows "Checking file..." until
- *    the hash verdict arrives, then navigates to Complete.
+ * 3. At 100% in EITHER direction the subtitle shows "Checking file..." while
+ *    the receiver hashes and the verdict travels back (verify-result).
+ * 4. The done event (now carrying the true verdict) navigates to Complete.
  */
 import { useEffect, useRef, useState } from "react";
 import { Button } from "../components/primitives";
@@ -88,7 +86,7 @@ export function ProgressScreen() {
   }, [go]);
 
   const pct = totalBytes > 0 ? Math.min(100, Math.round((transferred / totalBytes) * 100)) : 0;
-  const checking = !isSending && totalBytes > 0 && transferred >= totalBytes;
+  const checking = totalBytes > 0 && transferred >= totalBytes;
   const secondsLeft = speed > 0 ? Math.max(1, Math.round((totalBytes - transferred) / speed)) : 0;
 
   return (

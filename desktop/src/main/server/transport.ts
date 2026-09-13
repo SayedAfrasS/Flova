@@ -1,30 +1,23 @@
 /**
  * WORKFLOW OF THIS FILE:
  * 1. Owns the WebSocket server, the peer, and the offer/accept handshake.
- * 2. RESUME (Phase 11):
- *    - offerFile() also saves a send-side sidecar (userData folder) recording
- *      transferId, file path, size and whole-file hash.
- *    - When a peer reconnects (hello), each side checks for unfinished work:
- *      sender sends "resume-offer"; receiver matches its .part sidecar by
- *      transferId and replies "resume-accept" with the indices already on disk.
- *    - The sender then streams ONLY missing indices; progress is seeded with
- *      the bytes the receiver already has, so the UI continues from e.g. 61%.
- *    - Sidecars are deleted on success, on decline, or when they go stale.
- * 3. Integrity: per-segment SHA-256 in frame headers (nack + resend on
- *    mismatch) and a whole-file hash re-checked after file-end.
- * 4. Sending: adaptive worker pool (2-8) pulling from a missing-index queue.
- * 5. Receiving: offset writes into a pre-allocated .part file; recv sidecar
- *    updated every 25 segments so a crash never loses the bitmap.
+ * 2. SENDING: adaptive worker pool streams missing segments; after file-end
+ *    the sender WAITS for the receiver's verify-result (20s timeout) before
+ *    reporting done, so a failed hash can never look like a success here.
+ * 3. RECEIVING: offset writes into a pre-allocated .part file; after the
+ *    whole-file hash check the receiver sends verify-result {ok} back.
+ * 4. RESUME: send sidecar + recv sidecar survive crashes; resume-offer /
+ *    resume-accept exchange replays only the missing segments.
+ * 5. Integrity: per-segment SHA-256 in frame headers (nack + resend).
  *
  * FUNCTIONS:
- *  - hashFile()           : streaming SHA-256 of a whole file.
- *  - offerFile()          : hash + save send sidecar + send offer.
+ *  - offerFile()          : hash + save sidecar + send offer.
  *  - maybeOfferResume()   : after hello, propose resuming an interrupted send.
- *  - startFileStream()    : worker pool over the missing-index queue.
- *  - acceptIncoming()     : fresh receive: pre-allocate .part, reply accept.
- *  - handleResumeOffer()  : match recv sidecar, reopen .part, reply accept.
+ *  - startFileStream()    : worker pool, then await receiver verdict.
+ *  - acceptIncoming()     : pre-allocate .part, reply file-accept.
+ *  - handleResumeOffer()  : match sidecar, reopen .part, reply resume-accept.
  *  - handleBinaryFrame()  : verify hash -> write at offset -> ack or nack.
- *  - finishIncomingFile() : whole-file verify, rename or delete, notify UI.
+ *  - finishIncomingFile() : whole-file verify, send verify-result, rename.
  */
 import { WebSocketServer, WebSocket } from 'ws'
 import { app } from 'electron'
@@ -41,6 +34,7 @@ const CHUNK_SIZE = 4 * 1024 * 1024
 const MIN_WORKERS = 2
 const START_WORKERS = 4
 const MAX_WORKERS = 8
+const VERIFY_TIMEOUT_MS = 20000
 
 export class TransportServer {
   private wss: WebSocketServer
@@ -67,6 +61,7 @@ export class TransportServer {
   private ackResolvers = new Map<number, () => void>()
   private resendQueue: number[] = []
   private sendAborted = false
+  private verifyResolver: ((ok: boolean) => void) | null = null
 
   // UI state
   private currentTransfer: TransferMeta | null = null
@@ -74,7 +69,7 @@ export class TransportServer {
 
   onPeerConnected?: (peer: Peer) => void
   onPeerDisconnected?: () => void
-  onIncomingOffer?: (name: string, size: number) => void
+  onIncomingOffer?: (name: string; size: number) => void
   onSendAccepted?: () => void
   onSendDeclined?: () => void
   onFileTransferStart?: (meta: TransferMeta) => void
@@ -115,6 +110,20 @@ export class TransportServer {
     return h.digest('hex')
   }
 
+  // sender waits for the receiver's hash verdict (timeout = assume ok)
+  private awaitVerify(): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      this.verifyResolver = resolve
+      setTimeout(() => {
+        if (this.verifyResolver === resolve) {
+          this.verifyResolver = null
+          console.warn('[transport] verify-result timeout, assuming ok')
+          resolve(true)
+        }
+      }, VERIFY_TIMEOUT_MS)
+    })
+  }
+
   private handle(ws: WebSocket): void {
     if (this.peerWs) { ws.close(1013, 'already connected'); return }
 
@@ -134,6 +143,10 @@ export class TransportServer {
           ws.send(JSON.stringify({ type: 'pong' }))
         } else if (msg?.type === 'pong') {
           this.lastPong = Date.now()
+        } else if (msg?.type === 'verify-result') {
+          const r = this.verifyResolver
+          this.verifyResolver = null
+          if (r) r(msg.ok === true)
         } else if (msg?.type === 'chunk-ack') {
           const i = Number(msg.i)
           const resolve = this.ackResolvers.get(i)
@@ -195,8 +208,9 @@ export class TransportServer {
         this.sendAborted = true
         for (const resolve of this.ackResolvers.values()) resolve()
         this.ackResolvers.clear()
+        if (this.verifyResolver) { const r = this.verifyResolver; this.verifyResolver = null; r(false) }
         if (this.recvFd != null) { try { fs.closeSync(this.recvFd) } catch {} this.recvFd = null }
-        this.writeSidecar() // bitmap survives for resume
+        this.writeSidecar()
         this.currentTransfer = null
         this.onPeerDisconnected?.()
       }
@@ -214,7 +228,6 @@ export class TransportServer {
     const meta: TransferMeta = { name: path.basename(filePath), size: stats.size, isSending: true }
     this.currentTransfer = meta
     this.lastTransfer = meta
-    // remember what we are shipping so a reconnect can resume it
     fs.writeFileSync(this.sendSidecarPath(), JSON.stringify({
       transferId, filePath, name: meta.name, size: stats.size,
       chunkSize: CHUNK_SIZE, chunkCount: Math.ceil(stats.size / CHUNK_SIZE), fileHash,
@@ -229,7 +242,6 @@ export class TransportServer {
     try { fs.unlinkSync(this.sendSidecarPath()) } catch {}
   }
 
-  // after hello: propose resuming an interrupted send, if any
   private maybeOfferResume(): void {
     const p = this.sendSidecarPath()
     if (!fs.existsSync(p)) return
@@ -260,7 +272,6 @@ export class TransportServer {
     this.onFileTransferStart?.({ name, size, isSending: true, resumed: resumedBytes })
     this.peerWs.send(JSON.stringify({ type: 'file-start', name, size }))
 
-    // queue only the indices the receiver does not have yet
     const missing: number[] = []
     for (let i = 0; i < count; i++) if (!skip.has(i)) missing.push(i)
     let queuePos = 0
@@ -344,8 +355,10 @@ export class TransportServer {
     fs.closeSync(fd)
     if (!this.sendAborted && this.peerWs) {
       this.peerWs.send(JSON.stringify({ type: 'file-end' }))
-      this.clearSendSidecar() // finished: nothing left to resume
-      this.onFileDone?.(name, true, true)
+      // wait for the receiver's hash verdict before declaring success
+      const verified = await this.awaitVerify()
+      this.clearSendSidecar()
+      this.onFileDone?.(name, true, verified)
     }
     this.resumeState = null
     this.currentTransfer = null
@@ -362,7 +375,7 @@ export class TransportServer {
     this.pendingIncoming = null
 
     const saveDir = this.recvDir()
-    // sweep orphaned sidecars/.part files from dead transfers
+    // sweep orphaned sidecars/.part files from dead transfers (snapshot first)
     for (const f of fs.readdirSync(saveDir)) {
       if (f.endsWith('.flova.json') && !f.includes(transferId)) {
         try {
@@ -372,6 +385,8 @@ export class TransportServer {
         } catch {}
       }
     }
+
+    if (this.recvFd != null) { try { fs.closeSync(this.recvFd) } catch {} this.recvFd = null }
 
     const partPath = path.join(saveDir, `${name}.part`)
     this.recvFd = fs.openSync(partPath, 'w')
@@ -397,7 +412,6 @@ export class TransportServer {
     this.peerWs.send(JSON.stringify({ type: 'file-decline' }))
   }
 
-  // receiver side of resume: match sidecar, reopen .part, report what we have
   private handleResumeOffer(msg: any): void {
     const transferId = String(msg.transferId ?? '')
     const size = Number(msg.size)
@@ -413,7 +427,8 @@ export class TransportServer {
       const sc = JSON.parse(fs.readFileSync(sidecar, 'utf8'))
       if (sc.size !== size) throw new Error('size mismatch')
       const received: number[] = Array.isArray(sc.received) ? sc.received : []
-      this.recvFd = fs.openSync(partPath, 'r+') // keep existing bytes
+      if (this.recvFd != null) { try { fs.closeSync(this.recvFd) } catch {} this.recvFd = null }
+      this.recvFd = fs.openSync(partPath, 'r+')
       this.recvPartPath = partPath
       this.recvFinalName = name
       this.recvSize = size
@@ -485,6 +500,8 @@ export class TransportServer {
         const actual = await this.hashFile(partPath)
         verified = actual === expected
       }
+      // tell the sender the truth before doing anything else
+      this.peerWs?.send(JSON.stringify({ type: 'verify-result', ok: verified }))
       if (!verified) {
         try { fs.unlinkSync(partPath) } catch {}
         this.cleanupRecvState()
