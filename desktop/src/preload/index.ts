@@ -1,68 +1,80 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. Exposes the typed flova API to the renderer through contextBridge.
- * 2. Includes the receive-handshake methods: incoming offer, accept, decline.
- * 3. Includes the send-handshake events: accepted, declined.
+ * 1. Exposes safe IPC APIs to the renderer process.
+ * 2. Provides methods for file picking, queuing, and transfer control.
+ * 3. Provides event listeners for transfer lifecycle events.
+ * 4. Uses contextBridge to prevent direct access to Node.js APIs.
+ *
+ * FUNCTIONS:
+ *  - pickFiles()      : open file picker dialog.
+ *  - enqueueFiles()   : add files to transfer queue.
+ *  - cancelTransfer() : cancel a specific or active transfer.
+ *  - getQueue()       : get queue state and file list.
+ *  - acceptFile()     : accept an incoming file offer.
+ *  - declineFile()    : decline an incoming file offer.
+ *  - on*()            : subscribe to transfer events.
  */
-import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 
-type Meta = { name: string; size: number; isSending: boolean }
+import { contextBridge, ipcRenderer } from 'electron';
 
-const api = {
-  getServer: () => ipcRenderer.invoke('net:getServer') as Promise<{ host: string; port: number }>,
-  getState: () => ipcRenderer.invoke('net:getState') as Promise<'waiting' | 'paired'>,
-  getPeerName: () => ipcRenderer.invoke('net:getPeerName') as Promise<string | null>,
-  onPeerConnected: (cb: (name: string) => void) => {
-    const l = (_e: IpcRendererEvent, n: string) => cb(n)
-    ipcRenderer.on('net:peer-connected', l)
-    return () => ipcRenderer.removeListener('net:peer-connected', l)
-  },
-  onPeerDisconnected: (cb: () => void) => {
-    const l = () => cb()
-    ipcRenderer.on('net:peer-disconnected', l)
-    return () => ipcRenderer.removeListener('net:peer-disconnected', l)
-  },
-
-  pickFile: () => ipcRenderer.invoke('file:pick') as Promise<string | null>,
-  getFileStats: (p: string) => ipcRenderer.invoke('file:getStats', p) as Promise<{ name: string; size: number } | null>,
-  sendFile: (p: string) => ipcRenderer.invoke('file:send', p) as Promise<boolean>,
-  onSendAccepted: (cb: () => void) => {
-    const l = () => cb()
-    ipcRenderer.on('file:send-accepted', l)
-    return () => ipcRenderer.removeListener('file:send-accepted', l)
-  },
-  onSendDeclined: (cb: () => void) => {
-    const l = () => cb()
-    ipcRenderer.on('file:send-declined', l)
-    return () => ipcRenderer.removeListener('file:send-declined', l)
-  },
-
-  getIncomingOffer: () => ipcRenderer.invoke('file:getIncomingOffer') as Promise<{ name: string; size: number } | null>,
-  acceptIncoming: () => ipcRenderer.invoke('file:acceptIncoming') as Promise<boolean>,
-  declineIncoming: () => ipcRenderer.invoke('file:declineIncoming') as Promise<boolean>,
-  onIncomingOffer: (cb: (d: { name: string; size: number }) => void) => {
-    const l = (_e: IpcRendererEvent, d: { name: string; size: number }) => cb(d)
-    ipcRenderer.on('file:incoming-offer', l)
-    return () => ipcRenderer.removeListener('file:incoming-offer', l)
-  },
-
-  getCurrentTransfer: () => ipcRenderer.invoke('file:getCurrentTransfer') as Promise<Meta | null>,
-  getLastTransfer: () => ipcRenderer.invoke('file:getLastTransfer') as Promise<Meta | null>,
-  onFileTransferStart: (cb: (m: Meta) => void) => {
-    const l = (_e: IpcRendererEvent, m: Meta) => cb(m)
-    ipcRenderer.on('file:transfer-start', l)
-    return () => ipcRenderer.removeListener('file:transfer-start', l)
-  },
-  onFileProgress: (cb: (d: { bytes: number; isSending: boolean }) => void) => {
-    const l = (_e: IpcRendererEvent, d: { bytes: number; isSending: boolean }) => cb(d)
-    ipcRenderer.on('file:progress', l)
-    return () => ipcRenderer.removeListener('file:progress', l)
-  },
-  onFileDone: (cb: (d: { name: string; isSending: boolean }) => void) => {
-    const l = (_e: IpcRendererEvent, d: { name: string; isSending: boolean }) => cb(d)
-    ipcRenderer.on('file:done', l)
-    return () => ipcRenderer.removeListener('file:done', l)
-  },
+export interface QueuedFile {
+  id: string;
+  path: string;
+  name: string;
+  size: number;
+  status: 'pending' | 'active' | 'completed' | 'failed';
+  progress: number;
 }
 
-contextBridge.exposeInMainWorld('flova', api)
+export interface TransferMeta {
+  id: string;
+  name: string;
+  size: number;
+  isSending: boolean;
+  verified?: boolean;
+  resumed?: number;
+}
+
+contextBridge.exposeInMainWorld('flova', {
+  // File operations
+  pickFiles: () => ipcRenderer.invoke('file:pick'),
+  enqueueFiles: (files: { path: string; name: string; size: number }[]) =>
+    ipcRenderer.invoke('file:enqueue', files),
+  cancelTransfer: (id?: string) => ipcRenderer.invoke('file:cancel', id),
+  getQueue: () => ipcRenderer.invoke('file:getQueue'),
+
+  // Incoming file handling
+  acceptFile: (id: string) => ipcRenderer.invoke('file:accept', id),
+  declineFile: (id: string) => ipcRenderer.invoke('file:decline', id),
+
+  // Event listeners
+  onSendAccepted: (callback: (id: string) => void) => {
+    ipcRenderer.on('file:send-accepted', (_, id) => callback(id));
+    return () => ipcRenderer.removeAllListeners('file:send-accepted');
+  },
+
+  onSendDeclined: (callback: (id: string) => void) => {
+    ipcRenderer.on('file:send-declined', (_, id) => callback(id));
+    return () => ipcRenderer.removeAllListeners('file:send-declined');
+  },
+
+  onFileTransferStart: (callback: (meta: TransferMeta) => void) => {
+    ipcRenderer.on('file:transfer-start', (_, meta) => callback(meta));
+    return () => ipcRenderer.removeAllListeners('file:transfer-start');
+  },
+
+  onFileProgress: (callback: (id: string, bytes: number, isSending: boolean) => void) => {
+    ipcRenderer.on('file:progress', (_, id, bytes, isSending) => callback(id, bytes, isSending));
+    return () => ipcRenderer.removeAllListeners('file:progress');
+  },
+
+  onFileDone: (callback: (id: string, name: string, isSending: boolean, verified: boolean) => void) => {
+    ipcRenderer.on('file:done', (_, id, name, isSending, verified) => callback(id, name, isSending, verified));
+    return () => ipcRenderer.removeAllListeners('file:done');
+  },
+
+  onIncomingOffer: (callback: (id: string, name: string, size: number) => void) => {
+    ipcRenderer.on('file:incoming-offer', (_, id, name, size) => callback(id, name, size));
+    return () => ipcRenderer.removeAllListeners('file:incoming-offer');
+  },
+});
