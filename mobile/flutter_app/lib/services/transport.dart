@@ -431,6 +431,16 @@ class TransportClient {
   }
 
   // ---------- receiving ----------
+  void declineIncoming() {
+    if (_pendingOfferName == null || _channel == null) return;
+    _channel!.sink.add(jsonEncode({'type': 'file-decline'}));
+    _pendingOfferName = null;
+    _pendingOfferSize = 0;
+    _pendingOfferId = null;
+    _pendingOfferHash = null;
+  }
+
+  // ---------- receiving ----------
   Future<void> acceptIncomingFile() async {
     if (_pendingOfferName == null) return;
     final saveDir = await _recvDir();
