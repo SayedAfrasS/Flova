@@ -1,29 +1,28 @@
 /// WORKFLOW OF THIS FILE:
 /// 1. Owns the WebSocket and the symmetric offer/accept handshake.
-/// 2. RESUME: send-side sidecar + recv-side sidecar survive crashes and app
-///    relaunches; after hello the sender proposes resume-offer, the receiver
-///    matches its bitmap and replies resume-accept; workers then fetch only
-///    missing indices and progress seeds from the resumed byte count.
-/// 3. RESUME-RELAUNCH: on every successful hello-ack the session (host, port,
-///    peer name) is persisted via SessionStore so a relaunched app can
-///    reconnect with one tap instead of a new QR scan. Resume events that
-///    fire before the Home screen mounts are stashed in lastResumeEvent and
-///    consumed by the Home screen in initState.
-/// 4. Integrity: per-segment SHA-256 via NativeSha256 (nack + resend on
-///    mismatch) and a whole-file hash re-checked after file-end.
-/// 5. Sending: adaptive worker pool (2-8) over a missing-index queue.
-/// 6. Receiving: serialized offset writes into a pre-allocated .part file;
-///    recv sidecar updated every 25 segments so crashes lose nothing.
+/// 2. OFFER PEEK: a received file-offer is kept in pending state until it is
+///    accepted or declined, so a ReceiveScreen that mounts late can still
+///    read it (peekPendingOffer) instead of showing "Waiting for file...".
+/// 3. VERDICT: after file-end the receiver hashes the file and sends
+///    verify-result {ok} back; a SENDING transfer waits for that verdict
+///    (20s timeout) and only then emits its done event, so both devices
+///    always agree on success or failure.
+/// 4. RESUME: send + recv sidecars survive crashes/relaunches; resume-offer /
+///    resume-accept replay only missing segments with seeded progress.
+/// 5. Integrity: per-segment SHA-256 via NativeSha256 (nack + resend).
+/// 6. Sending: adaptive worker pool (2-8) over a missing-index queue.
+/// 7. Receiving: serialized offset writes into a pre-allocated .part file;
+///    recv sidecar updated every 25 segments.
 ///
 /// FUNCTIONS:
-///  - sendFile()            : hash + save sidecar + send offer.
-///  - _maybeOfferResume()   : after hello, propose resuming an interrupted send.
-///  - _streamFile()         : worker pool over the missing-index queue.
-///  - acceptIncomingFile()  : fresh receive: pre-allocate .part, reply accept.
-///  - _handleResumeOffer()  : match sidecar, reopen .part, reply accept.
-///  - takeLastResumeEvent() : hand a pre-mount resume event to the UI once.
-///  - _writeFrame()         : verify hash -> write at offset -> ack or nack.
-///  - _finishIncomingFile() : whole-file verify, rename or delete, emit done.
+///  - peekPendingOffer()  : current un-accepted offer, without consuming it.
+///  - sendFile()          : hash + save sidecar + send offer.
+///  - _maybeOfferResume() : after hello, propose resuming an interrupted send.
+///  - _streamFile()       : worker pool, then await receiver verdict.
+///  - acceptIncomingFile(): pre-allocate .part, reply file-accept.
+///  - _handleResumeOffer(): match sidecar, reopen .part, reply resume-accept.
+///  - _writeFrame()       : verify hash -> write at offset -> ack or nack.
+///  - _finishIncomingFile(): verify, send verify-result, rename or delete.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -64,6 +63,7 @@ class TransportClient {
   static const int minWorkers = 2;
   static const int startWorkers = 4;
   static const int maxWorkers = 8;
+  static const Duration verifyTimeout = Duration(seconds: 20);
 
   // receiving
   RandomAccessFile? _recvRaf;
@@ -81,16 +81,14 @@ class TransportClient {
   // sending
   File? _pendingSendFile;
   String _pendingSendName = ''; int _pendingSendSize = 0;
-  String? _pendingSendHash;
   Map<String, dynamic>? _resumeState;
   int _sentBytes = 0;
   bool _sendAborted = false;
   final Map<int, Completer<void>> _ackWaiters = {};
   final List<int> _resendQueue = [];
+  Completer<bool>? _verifyCompleter;
 
-  // RESUME-RELAUNCH: resume event that fired before any UI was listening
   FileEvent? _lastResumeEvent;
-  FileEvent? get lastResumeEvent => _lastResumeEvent;
   FileEvent? takeLastResumeEvent() {
     final e = _lastResumeEvent;
     _lastResumeEvent = null;
@@ -113,6 +111,12 @@ class TransportClient {
   static const Duration pingInterval = Duration(seconds: 3);
   static const Duration pongTimeout = Duration(seconds: 10);
   static const List<Duration> backoff = [Duration(seconds: 1), Duration(seconds: 2), Duration(seconds: 4), Duration(seconds: 8), Duration(seconds: 15)];
+
+  // the offer stays pending until accept/decline so late UI can read it
+  FileEvent? peekPendingOffer() {
+    if (_pendingOfferName == null) return null;
+    return FileEvent(name: _pendingOfferName!, size: _pendingOfferSize, isOffer: true);
+  }
 
   Future<File> _sendSidecarFile() async {
     final dir = await getApplicationDocumentsDirectory();
@@ -164,6 +168,18 @@ class TransportClient {
     }
   }
 
+  Future<bool> _waitVerify() async {
+    final c = Completer<bool>();
+    _verifyCompleter = c;
+    Timer(verifyTimeout, () {
+      if (!c.isCompleted) {
+        _verifyCompleter = null;
+        c.complete(true); // timeout: link delivered every ack, assume ok
+      }
+    });
+    return c.future;
+  }
+
   void _onMessage(dynamic data) {
     if (data is List<int>) { _handleBinaryFrame(data); return; }
     if (data is String) {
@@ -174,7 +190,6 @@ class TransportClient {
           peerName = msg['name'] as String?;
           _reconnectAttempt = 0; _lastPongMs = DateTime.now().millisecondsSinceEpoch;
           _startHeartbeat(); _stateCtrl.add(TransportState.paired);
-          // RESUME-RELAUNCH: remember how to reach this laptop next launch
           if (_host != null && _port != null) {
             SessionStore.save(host: _host!, port: _port!, peerName: peerName ?? 'Laptop');
           }
@@ -183,6 +198,10 @@ class TransportClient {
           _channel?.sink.add(jsonEncode({'type': 'pong'}));
         } else if (type == 'pong') {
           _lastPongMs = DateTime.now().millisecondsSinceEpoch;
+        } else if (type == 'verify-result') {
+          final c = _verifyCompleter;
+          _verifyCompleter = null;
+          if (c != null && !c.isCompleted) c.complete(msg['ok'] == true);
         } else if (type == 'chunk-ack') {
           final i = (msg['i'] as num).toInt();
           _ackWaiters.remove(i)?.complete();
@@ -219,7 +238,7 @@ class TransportClient {
             _sentBytes = resumed;
             _sendStateCtrl.add(SendState.accepted);
             final ev = FileEvent(name: _pendingSendName, size: _pendingSendSize, sending: true, isResume: true);
-            _lastResumeEvent = ev; // stash in case UI is not mounted yet
+            _lastResumeEvent = ev;
             _fileEventCtrl.add(ev);
             _streamFile(file, received, resumed);
             _pendingSendFile = null;
@@ -245,7 +264,6 @@ class TransportClient {
     _pendingSendName = file.path.split(Platform.pathSeparator).last;
     _sentBytes = 0;
     final fileHash = await NativeSha256.hashFile(file.path);
-    _pendingSendHash = fileHash;
     final transferId = 't${DateTime.now().millisecondsSinceEpoch}';
     try {
       final sc = await _sendSidecarFile();
@@ -288,7 +306,6 @@ class TransportClient {
       _pendingSendFile = file;
       _pendingSendName = s['name'] as String;
       _pendingSendSize = (s['size'] as num).toInt();
-      _pendingSendHash = s['fileHash'] as String?;
       _resumeState = s;
       _channel?.sink.add(jsonEncode({
         'type': 'resume-offer',
@@ -405,7 +422,10 @@ class TransportClient {
 
     if (!_sendAborted && _channel != null) {
       _channel!.sink.add(jsonEncode({'type': 'file-end'}));
+      // wait for the receiver's hash verdict before declaring success
+      final ok = await _waitVerify();
       await _clearSendSidecar();
+      _fileEventCtrl.add(FileEvent(name: _pendingSendName, size: size, isDone: true, ok: ok, sending: true));
     }
     _resumeState = null;
   }
@@ -415,7 +435,8 @@ class TransportClient {
     if (_pendingOfferName == null) return;
     final saveDir = await _recvDir();
 
-    await for (final e in saveDir.list()) {
+    final entries = await saveDir.list().toList(); // snapshot, then delete
+    for (final e in entries) {
       if (e.path.endsWith('.flova.json') && !e.path.contains(_pendingOfferId!)) {
         try {
           final sc = jsonDecode(await File(e.path).readAsString()) as Map<String, dynamic>;
@@ -428,6 +449,8 @@ class TransportClient {
         } catch (_) {}
       }
     }
+
+    if (_recvRaf != null) { try { await _recvRaf!.close(); } catch (_) {} _recvRaf = null; }
 
     final safeName = _pendingOfferName!.split(Platform.pathSeparator).last;
     final partFile = File('${saveDir.path}/$safeName.part');
@@ -468,6 +491,7 @@ class TransportClient {
       if ((sc['size'] as num).toInt() != size) throw Exception('size mismatch');
 
       final received = (sc['received'] as List? ?? []).map((e) => (e as num).toInt()).toSet();
+      if (_recvRaf != null) { try { await _recvRaf!.close(); } catch (_) {} _recvRaf = null; }
       final raf = await partFile.open(mode: FileMode.write);
       _recvRaf = raf;
       _recvPartFile = partFile;
@@ -488,7 +512,7 @@ class TransportClient {
 
       _channel?.sink.add(jsonEncode({'type': 'resume-accept', 'transferId': transferId, 'received': received.toList()}));
       final ev = FileEvent(name: name, size: size, sending: false, isResume: true);
-      _lastResumeEvent = ev; // stash in case UI is not mounted yet
+      _lastResumeEvent = ev;
       _fileEventCtrl.add(ev);
     } catch (_) {
       _channel?.sink.add(jsonEncode({'type': 'resume-decline', 'transferId': transferId}));
@@ -555,6 +579,9 @@ class TransportClient {
       ok = actual == expected;
     }
 
+    // tell the sender the truth first
+    _channel?.sink.add(jsonEncode({'type': 'verify-result', 'ok': ok}));
+
     if (!ok) {
       try { await part.delete(); } catch (_) {}
       _recvPartFile = null; _recvFinalName = null; _recvTransferId = null; _recvExpectedHash = null;
@@ -587,6 +614,10 @@ class TransportClient {
     _sendAborted = true;
     for (final w in _ackWaiters.values) { if (!w.isCompleted) w.complete(); }
     _ackWaiters.clear();
+    if (_verifyCompleter != null && !_verifyCompleter!.isCompleted) {
+      _verifyCompleter!.complete(false);
+      _verifyCompleter = null;
+    }
     _writeSidecar();
     if (_host != null && _port != null) { _stateCtrl.add(TransportState.reconnecting); _scheduleReconnect(); }
     else _stateCtrl.add(TransportState.disconnected);
