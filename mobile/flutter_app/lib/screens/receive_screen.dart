@@ -1,131 +1,172 @@
 /// WORKFLOW OF THIS FILE:
-/// 1. Shows the incoming-file decision: Accept or Decline.
-/// 2. On mount it PEEKS the transport's pending offer, so it shows the file
-///    immediately even though the offer event fired before this screen
-///    existed (this fixes the old "Waiting for file..." dead end).
-/// 3. It also listens for later offers while it stays open.
-/// 4. Accept opens the disk sink + replies file-accept, then opens Progress.
-/// 5. Decline replies file-decline and pops; onDismissed tells HomeScreen
-///    this screen is gone so a future offer can push a fresh one.
-import 'dart:async';
+/// 1. Displays incoming file offers from the peer.
+/// 2. Shows file name, size, and accept/decline buttons.
+/// 3. On accept, transitions to ProgressScreen for the transfer.
+/// 4. On decline, sends rejection and closes the screen.
+/// 5. Handles multiple queued offers sequentially.
+///
+/// FUNCTIONS:
+///  - _buildOfferUI()     : display file details and action buttons.
+///  - _buildWaitingUI()   : show waiting state when no offer is pending.
+///  - _handleAccept()     : accept the offer and navigate to progress.
+///  - _handleDecline()    : decline the offer and pop the screen.
+
 import 'package:flutter/material.dart';
-import '../core/tokens.dart';
-import '../core/transfer.dart';
 import '../services/transport.dart';
 import 'progress_screen.dart';
 
 class ReceiveScreen extends StatefulWidget {
   final TransportClient transport;
-  final VoidCallback? onDismissed;
-  const ReceiveScreen({super.key, required this.transport, this.onDismissed});
+
+  const ReceiveScreen({super.key, required this.transport});
 
   @override
   State<ReceiveScreen> createState() => _ReceiveScreenState();
 }
 
 class _ReceiveScreenState extends State<ReceiveScreen> {
-  StreamSubscription<FileEvent>? _sub;
-  FileEvent? _offer;
-  bool _accepted = false;
+  ({String id, String name, int size})? _offer;
+  bool _accepting = false;
 
   @override
   void initState() {
     super.initState();
-    // read an offer that arrived before this screen mounted
-    _offer = widget.transport.peekPendingOffer();
-    _sub = widget.transport.fileEventStream.listen((event) {
-      if (event.isOffer && !_accepted && mounted) setState(() => _offer = event);
-    });
+    widget.transport.offerStream.listen(_handleOffer);
   }
 
-  @override
-  void dispose() {
-    _sub?.cancel();
-    widget.onDismissed?.call();
-    super.dispose();
+  void _handleOffer(({String id, String name, int size}) offer) {
+    if (mounted) {
+      setState(() {
+        _offer = offer;
+        _accepting = false;
+      });
+    }
   }
 
-  Future<void> _accept() async {
-    if (_offer == null) return;
-    setState(() => _accepted = true);
-    await widget.transport.acceptIncomingFile();
-    if (!mounted) return;
-    Navigator.of(context).pushReplacement(MaterialPageRoute(
-      builder: (_) => ProgressScreen(
-        info: TransferInfo(
-          name: _offer!.name,
-          size: _formatBytes(_offer!.size),
-          bytes: _offer!.size.toDouble(),
-          sending: false,
-        ),
-        transport: widget.transport,
-      ),
-    ));
-  }
+  void _handleAccept() {
+    if (_offer == null || _accepting) return;
+    setState(() => _accepting = true);
 
-  void _decline() {
-    widget.transport.declineIncoming();
-    Navigator.of(context).pop();
-  }
-
-  String _formatBytes(int bytes) {
-    if (bytes >= 1024 * 1024 * 1024) return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
-    if (bytes >= 1024 * 1024) return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-    return '${(bytes / 1024).round()} KB';
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final text = Theme.of(context).textTheme;
-    return Scaffold(
-      appBar: AppBar(
-        backgroundColor: FlovaTokens.canvas, surfaceTintColor: Colors.transparent,
-        title: const Text('Receive a file', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: FlovaTokens.ink)),
-      ),
-      body: SafeArea(
-        child: Center(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 32),
-            child: _offer == null ? _buildWaiting(text) : _buildOffer(text),
-          ),
+    widget.transport.acceptIncoming(_offer!.id);
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (context) => ProgressScreen(
+          transport: widget.transport,
+          fileId: _offer!.id,
+          fileName: _offer!.name,
+          fileSize: _offer!.size,
+          isSending: false,
         ),
       ),
     );
   }
 
-  Widget _buildWaiting(TextTheme text) {
-    return Column(mainAxisSize: MainAxisSize.min, children: [
-      const SizedBox(width: 48, height: 48, child: CircularProgressIndicator(color: FlovaTokens.accent)),
-      const SizedBox(height: 24),
-      Text('Waiting for file...', style: text.headlineMedium, textAlign: TextAlign.center),
-      const SizedBox(height: 8),
-      Text('Choose a file on your laptop and send it.', style: text.bodyMedium, textAlign: TextAlign.center),
-    ]);
+  void _handleDecline() {
+    if (_offer == null) return;
+    widget.transport.declineIncoming(_offer!.id);
+    Navigator.of(context).pop();
   }
 
-  Widget _buildOffer(TextTheme text) {
-    return Column(mainAxisSize: MainAxisSize.min, children: [
-      Container(
-        width: 80, height: 80,
-        decoration: BoxDecoration(color: FlovaTokens.surface, border: Border.all(color: FlovaTokens.line), borderRadius: BorderRadius.circular(FlovaTokens.rCard)),
-        child: const Icon(Icons.description_outlined, size: 36, color: FlovaTokens.accent),
+  String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+  }
+
+  Widget _buildWaitingUI() {
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        const CircularProgressIndicator(),
+        const SizedBox(height: 24),
+        const Text(
+          'Waiting for files...',
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.w500),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          'The sender is preparing files to send to you.',
+          style: TextStyle(fontSize: 14, color: Colors.grey[600]),
+          textAlign: TextAlign.center,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildOfferUI() {
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Icon(Icons.file_present, size: 64, color: Theme.of(context).primaryColor),
+        const SizedBox(height: 24),
+        const Text(
+          'Incoming File',
+          style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
+        ),
+        const SizedBox(height: 16),
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.grey[100],
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Column(
+            children: [
+              Text(
+                _offer!.name,
+                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                _formatBytes(_offer!.size),
+                style: TextStyle(fontSize: 14, color: Colors.grey[600]),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 32),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            OutlinedButton(
+              onPressed: _accepting ? null : _handleDecline,
+              style: OutlinedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 12),
+              ),
+              child: const Text('Decline'),
+            ),
+            const SizedBox(width: 16),
+            ElevatedButton(
+              onPressed: _accepting ? null : _handleAccept,
+              style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 12),
+              ),
+              child: _accepting
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Text('Accept'),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Receive File')),
+      body: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Center(
+          child: _offer == null ? _buildWaitingUI() : _buildOfferUI(),
+        ),
       ),
-      const SizedBox(height: 16),
-      Text('Incoming file', style: text.headlineMedium, textAlign: TextAlign.center),
-      const SizedBox(height: 8),
-      Text(_offer!.name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500, color: FlovaTokens.ink), textAlign: TextAlign.center),
-      const SizedBox(height: 4),
-      Text('${_formatBytes(_offer!.size)} · From ${widget.transport.peerName ?? 'Laptop'}', style: text.bodyMedium),
-      const SizedBox(height: 32),
-      SizedBox(
-        width: double.infinity,
-        child: FilledButton(onPressed: _accepted ? null : _accept, child: Text(_accepted ? 'Preparing...' : 'Accept')),
-      ),
-      const SizedBox(height: 12),
-      SizedBox(
-        width: double.infinity,
-        child: OutlinedButton(onPressed: _accepted ? null : _decline, child: const Text('Decline')),
-      ),
-    ]);
+    );
   }
 }
