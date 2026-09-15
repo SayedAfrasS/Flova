@@ -1,14 +1,13 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. Preload script runs in a sandboxed context between main and renderer.
- * 2. Exposes the flova API to the renderer via contextBridge.
- * 3. All IPC calls go through ipcRenderer to the main process.
- * 4. Event listeners are wrapped to return unsubscribe functions.
+ * 1. Preload bridge between main process and renderer.
+ * 2. Exposes network, file, transfer-event and history APIs as window.flova.
+ * 3. Event subscriptions return unsubscribe functions for clean effects.
+ * 4. getProgress reads current bytes from the transport layer.
  */
 import { contextBridge, ipcRenderer } from 'electron'
 
 const api = {
-  // Network
   getServer: () => ipcRenderer.invoke('net:getServer'),
   getState: () => ipcRenderer.invoke('net:getState'),
   getPeerName: () => ipcRenderer.invoke('net:getPeerName'),
@@ -23,7 +22,6 @@ const api = {
     return () => ipcRenderer.removeListener('net:peer-disconnected', listener)
   },
 
-  // File operations
   pickFile: () => ipcRenderer.invoke('file:pick'),
   pickMultipleFiles: () => ipcRenderer.invoke('file:pickMultiple'),
   getFileStats: (path: string) => ipcRenderer.invoke('file:getStats', path),
@@ -31,8 +29,6 @@ const api = {
   sendMultipleFiles: (paths: string[]) => ipcRenderer.invoke('file:sendMultiple', paths),
   cancelQueue: () => ipcRenderer.invoke('file:cancelQueue'),
   getQueueInfo: () => ipcRenderer.invoke('file:getQueueInfo'),
-
-  // Incoming files
   getIncomingOffer: () => ipcRenderer.invoke('file:getIncomingOffer'),
   acceptIncoming: () => ipcRenderer.invoke('file:acceptIncoming'),
   declineIncoming: () => ipcRenderer.invoke('file:declineIncoming'),
@@ -41,8 +37,6 @@ const api = {
     ipcRenderer.on('file:incoming-offer', listener)
     return () => ipcRenderer.removeListener('file:incoming-offer', listener)
   },
-
-  // Transfer events
   onSendAccepted: (callback: () => void) => {
     const listener = () => callback()
     ipcRenderer.on('file:send-accepted', listener)
@@ -53,8 +47,8 @@ const api = {
     ipcRenderer.on('file:send-declined', listener)
     return () => ipcRenderer.removeListener('file:send-declined', listener)
   },
-  onFileTransferStart: (callback: (meta: { name: string; size: number; isSending: boolean; resumed?: number }) => void) => {
-    const listener = (_event: any, meta: { name: string; size: number; isSending: boolean; resumed?: number }) => callback(meta)
+  onFileTransferStart: (callback: (meta: { name: string; size: number; isSending: boolean; resumed?: number; queueIndex?: number; queueTotal?: number }) => void) => {
+    const listener = (_event: any, meta: any) => callback(meta)
     ipcRenderer.on('file:transfer-start', listener)
     return () => ipcRenderer.removeListener('file:transfer-start', listener)
   },
@@ -73,10 +67,10 @@ const api = {
     ipcRenderer.on('file:queue-advance', listener)
     return () => ipcRenderer.removeListener('file:queue-advance', listener)
   },
-
-  // Transfer state
   getCurrentTransfer: () => ipcRenderer.invoke('file:getCurrentTransfer'),
   getLastTransfer: () => ipcRenderer.invoke('file:getLastTransfer'),
+  getProgress: () => ipcRenderer.invoke('file:getProgress'),
+  getHistory: () => ipcRenderer.invoke('history:list'),
 }
 
 contextBridge.exposeInMainWorld('flova', api)
