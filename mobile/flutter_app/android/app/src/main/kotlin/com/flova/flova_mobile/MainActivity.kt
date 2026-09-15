@@ -5,78 +5,67 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.security.MessageDigest
+import kotlin.concurrent.thread
 
-/**
- * WORKFLOW OF THIS FILE:
- * 1. Standard Flutter activity for the app.
- * 2. Registers a MethodChannel named "com.flova.flova_mobile/hash".
- * 3. "hashFile": streams a file from disk through the native SHA-256
- *    MessageDigest (hardware accelerated) and returns the hex string.
- * 4. "hashBytes": hashes an in-memory byte array the same way.
- * 5. Both run on background threads so the UI thread never blocks.
- *    The Dart side falls back to pure Dart hashing when this channel
- *    is unavailable (other platforms), so integrity never disappears.
- */
+// WORKFLOW OF THIS FILE:
+// 1. Registers a MethodChannel named "com.flova.flova_mobile/native_sha256".
+// 2. "hashFile" streams a file in 8 MB chunks through SHA-256 on a background
+//    thread and returns the lowercase hex digest (never blocks the UI thread).
+// 3. "hashBytes" hashes an in-memory byte array the same way.
+// 4. Both return lowercase hex so the Dart side can compare case-insensitively.
 class MainActivity : FlutterActivity() {
-    private val channelName = "com.flova.flova_mobile/hash"
+    private val CHANNEL = "com.flova.flova_mobile/native_sha256"
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "hashFile" -> {
                         val path = call.argument<String>("path")
                         if (path == null) {
-                            result.error("bad_args", "path missing", null)
-                            return@setMethodCallHandler
-                        }
-                        Thread {
-                            try {
-                                result.success(hexOf(digestFile(File(path))))
-                            } catch (e: Exception) {
-                                result.error("hash_failed", e.message, null)
+                            result.error("BAD_ARGS", "path is required", null)
+                        } else {
+                            thread {
+                                try {
+                                    result.success(hashFile(path))
+                                } catch (e: Exception) {
+                                    result.error("HASH_ERROR", e.message, null)
+                                }
                             }
-                        }.start()
+                        }
                     }
                     "hashBytes" -> {
                         val bytes = call.argument<ByteArray>("bytes")
                         if (bytes == null) {
-                            result.error("bad_args", "bytes missing", null)
-                            return@setMethodCallHandler
-                        }
-                        Thread {
-                            try {
-                                val md = MessageDigest.getInstance("SHA-256")
-                                md.update(bytes)
-                                result.success(hexOf(md.digest()))
-                            } catch (e: Exception) {
-                                result.error("hash_failed", e.message, null)
+                            result.error("BAD_ARGS", "bytes is required", null)
+                        } else {
+                            thread {
+                                try {
+                                    val md = MessageDigest.getInstance("SHA-256")
+                                    md.update(bytes)
+                                    result.success(md.digest().joinToString("") { "%02x".format(it) })
+                                } catch (e: Exception) {
+                                    result.error("HASH_ERROR", e.message, null)
+                                }
                             }
-                        }.start()
+                        }
                     }
                     else -> result.notImplemented()
                 }
             }
     }
 
-    // streaming digest so big files never load fully into memory
-    private fun digestFile(file: File): ByteArray {
+    private fun hashFile(path: String): String {
         val md = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { ins ->
-            val buf = ByteArray(1 shl 20)
+        File(path).inputStream().use { ins ->
+            val buf = ByteArray(8 * 1024 * 1024)
             while (true) {
                 val n = ins.read(buf)
                 if (n <= 0) break
                 md.update(buf, 0, n)
             }
         }
-        return md.digest()
-    }
-
-    private fun hexOf(bytes: ByteArray): String {
-        val sb = StringBuilder(bytes.size * 2)
-        for (b in bytes) sb.append(String.format("%02x", b))
-        return sb.toString()
+        return md.digest().joinToString("") { "%02x".format(it) }
     }
 }
