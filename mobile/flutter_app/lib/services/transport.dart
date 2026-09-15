@@ -1,19 +1,16 @@
 /// WORKFLOW OF THIS FILE:
 /// 1. WebSocket client + peer lifecycle + heartbeat + session persistence.
-/// 2. QUEUE SENDING: offers go out one file at a time with queueIndex and
-///    queueTotal. After each verify-result the queue advances automatically.
-/// 3. QUEUE RECEIVING: an offer with queueIndex > 0 continues an accepted
-///    batch, so it is accepted silently (queueNext event updates the UI).
-///    Only queueIndex 0 raises the Accept/Decline screen.
-/// 4. RE-ENTRANT RECEIVER: _finishIncomingFile captures its state and swaps
-///    the write queue synchronously, so the next file can begin while the
-///    previous file is still being hash-verified.
-/// 5. Integrity: per-segment SHA-256 (nack+resend) + whole-file verify-result.
-/// 6. Resume: sidecars survive crashes; resume-offer replays missing segments.
+/// 2. Queue sending/receiving with auto-accept for continuation offers.
+/// 3. Integrity: per-segment SHA-256 (nack + resend) while streaming, then a
+///    whole-file SHA-256 after file-end. The whole-file check now drains all
+///    pending writes and flushes/closes the file BEFORE hashing, so the hash
+///    is always computed over the fully-finalized file.
+/// 4. Resume: sidecars survive crashes; resume-offer replays missing segments.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'native_sha256.dart';
@@ -257,7 +254,6 @@ class TransportClient {
           _pendingOfferId = (msg['transferId'] ?? 't0') as String;
           _pendingOfferHash = (msg['fileHash'] ?? '') as String;
           if (queueIndex > 0) {
-            // continuation of an accepted batch: silent accept, UI via queueNext
             _fileEventCtrl.add(FileEvent(
               name: _pendingOfferName!,
               size: _pendingOfferSize,
@@ -755,20 +751,24 @@ class TransportClient {
     } catch (_) {}
   }
 
-  // re-entrant: capture state and swap the write queue synchronously so the
-  // next queued file can start while this one is still being verified
+  /// Finalizes a received file. ORDER MATTERS:
+  /// 1) drain every pending segment write, 2) flush + close the handle,
+  /// 3) only then hash the fully-finalized file and compare.
   Future<void> _finishIncomingFile() async {
-    final raf = _recvRaf;
-    if (raf != null) {
-      try {
-        await raf.close();
-      } catch (_) {}
-      _recvRaf = null;
-    }
+    // 1. Drain all pending writes FIRST.
     final myQueue = _writeQueue;
     _writeQueue = Future<void>.value();
     await myQueue;
 
+    // 2. Flush and close the file handle so all bytes hit disk.
+    final raf = _recvRaf;
+    _recvRaf = null;
+    if (raf != null) {
+      try { await raf.flush(); } catch (_) {}
+      try { await raf.close(); } catch (_) {}
+    }
+
+    // Capture and release state.
     final part = _recvPartFile;
     final dir = _recvSaveDir;
     final finalName = _recvFinalName;
@@ -782,18 +782,25 @@ class TransportClient {
     _recvExpectedHash = null;
     _recvTransferId = null;
 
+    // 3. Verify whole-file hash over the finalized file.
     var ok = true;
-    if (expected != null) {
-      final actual = await NativeSha256.hashFile(part.path);
-      ok = actual == expected;
+    if (expected != null && expected.isNotEmpty) {
+      try {
+        final actual = await NativeSha256.hashFile(part.path);
+        ok = actual.toLowerCase() == expected.toLowerCase();
+        if (!ok) {
+          debugPrint('[flova] HASH MISMATCH file=$finalName expected=$expected actual=$actual');
+        }
+      } catch (e) {
+        debugPrint('[flova] HASH ERROR file=$finalName err=$e');
+        ok = false;
+      }
     }
 
     _channel?.sink.add(jsonEncode({'type': 'verify-result', 'ok': ok}));
 
     if (!ok) {
-      try {
-        await part.delete();
-      } catch (_) {}
+      try { await part.delete(); } catch (_) {}
       _fileEventCtrl.add(FileEvent(name: finalName, size: size, isDone: true, ok: false));
       return;
     }
