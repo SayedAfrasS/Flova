@@ -1,10 +1,8 @@
 /**
  * WORKFLOW OF THIS FILE:
  * 1. Root of the desktop UI: picks the screen from the nav store.
- * 2. Global watchers:
- *    - incoming file offer while on Home -> jump to the Receive screen.
- *    - any transfer start (including a RESUME after reconnect) while on
- *      Home -> jump to the Progress screen so the user sees it continue.
+ * 2. Global watchers: incoming offer jumps to Receive; transfer start (including
+ *    resume) jumps to Progress while on Home.
  */
 import { useEffect, type ComponentType } from "react";
 import { useNav, type Screen } from "./state/nav";

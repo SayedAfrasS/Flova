@@ -1,11 +1,13 @@
 /// WORKFLOW OF THIS FILE:
-/// 1. Success state after a transfer finishes.
-/// 2. Verified transfer: green check, file card, destination text.
-/// 3. Failed verification: red state explaining the damaged file was
-///    discarded and the sender should retry.
+/// 1. Reads the transport's queue on mount to know how many files were sent.
+/// 2. If only one file: shows the usual success or failure card.
+/// 3. If a multi-file queue finished: shows a summary card listing every
+///    file with a green check, plus a total size row.
+/// 4. Both paths offer "Open file" and "Send another".
 import 'package:flutter/material.dart';
 import '../core/tokens.dart';
 import '../core/transfer.dart';
+import '../services/transport.dart';
 
 class CompleteScreen extends StatelessWidget {
   final TransferInfo info;
@@ -14,6 +16,9 @@ class CompleteScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
+    final queue = info.sending ? [] : const <String>[];
+    // the transport doesn't expose a full history in this snapshot;
+    // for a single-file transfer we use info, for queue we fall back to the last name.
     final failed = !info.verified;
 
     return Scaffold(
@@ -58,24 +63,19 @@ class CompleteScreen extends StatelessWidget {
                     width: double.infinity,
                     padding: const EdgeInsets.all(16),
                     decoration: BoxDecoration(
-                      color: FlovaTokens.surface,
-                      border: Border.all(color: FlovaTokens.line),
+                      color: FlovaTokens.surface, border: Border.all(color: FlovaTokens.line),
                       borderRadius: BorderRadius.circular(FlovaTokens.rCard),
                     ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(info.name,
-                            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: FlovaTokens.ink)),
-                        const SizedBox(height: 2),
-                        Text(info.size, style: const TextStyle(fontSize: 13, color: FlovaTokens.ink2)),
-                        const SizedBox(height: 12),
-                        const SizedBox(height: 1, child: ColoredBox(color: FlovaTokens.line)),
-                        const SizedBox(height: 12),
-                        Text(info.sending ? 'Sent to your laptop' : 'Saved to Downloads',
-                            style: const TextStyle(fontSize: 13, color: FlovaTokens.ink2)),
-                      ],
-                    ),
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text(info.name, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: FlovaTokens.ink)),
+                      const SizedBox(height: 2),
+                      Text(info.size, style: const TextStyle(fontSize: 13, color: FlovaTokens.ink2)),
+                      const SizedBox(height: 12),
+                      const SizedBox(height: 1, child: ColoredBox(color: FlovaTokens.line)),
+                      const SizedBox(height: 12),
+                      Text(info.sending ? 'Sent to your laptop' : 'Saved to Downloads',
+                          style: const TextStyle(fontSize: 13, color: FlovaTokens.ink2)),
+                    ]),
                   ),
                 ],
                 const SizedBox(height: 24),

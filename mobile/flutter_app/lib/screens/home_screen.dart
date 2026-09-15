@@ -1,11 +1,3 @@
-/// WORKFLOW OF THIS FILE:
-/// 1. Mobile home shell: bottom navigation + connection overlay.
-/// 2. Incoming offers push ONE ReceiveScreen (guarded by _receiveOpen so a
-///    duplicate event can never stack a second screen on top).
-/// 3. RESUME: resume events push the Progress screen; a resume that finished
-///    before mount is consumed from the transport's stash in initState.
-/// 4. Overlay states: reconnecting / lost / "Checking transfer..." while the
-///    resume handshake runs right after pairing.
 import 'dart:async';
 import 'package:flutter/material.dart';
 import '../core/flova_mark.dart';
@@ -84,7 +76,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       if (event.isOffer) {
         setState(() => _checkingResume = false);
-        if (_receiveOpen) return; // never stack duplicate receive screens
+        if (_receiveOpen) return;
         _receiveOpen = true;
         Navigator.of(context).push(MaterialPageRoute(
           builder: (_) => ReceiveScreen(
@@ -302,7 +294,8 @@ class _HomeScreenState extends State<HomeScreen> {
       padding: const EdgeInsets.symmetric(vertical: 12),
       child: Row(children: [
         Container(
-          width: 36, height: 36,
+          width: 36,
+          height: 36,
           decoration: BoxDecoration(color: FlovaTokens.section, borderRadius: BorderRadius.circular(FlovaTokens.rControl)),
           child: const Icon(Icons.description_outlined, color: FlovaTokens.ink2, size: 18),
         ),

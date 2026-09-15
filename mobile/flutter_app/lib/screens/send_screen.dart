@@ -1,8 +1,3 @@
-/// WORKFLOW OF THIS FILE:
-/// 1. User picks a file with the real file_picker v12 API.
-/// 2. "Send file" sends only an offer, then waits for the laptop's decision.
-/// 3. On accept, opens the Progress screen (bytes start flowing at that moment).
-/// 4. On decline, shows a snackbar and re-enables the button.
 import 'dart:async';
 import 'dart:io';
 import 'package:file_picker/file_picker.dart';
@@ -21,55 +16,62 @@ class SendScreen extends StatefulWidget {
 }
 
 class _SendScreenState extends State<SendScreen> {
-  File? _selectedFile;
-  String _fileName = "";
-  int _fileSize = 0;
-  bool _waiting = false;
+  List<File> _files = [];
+  List<String> _names = [];
+  List<int> _sizes = [];
+  bool _isSending = false;
   StreamSubscription<SendState>? _sendSub;
 
   @override
   void dispose() { _sendSub?.cancel(); super.dispose(); }
 
-  Future<void> _pickFile() async {
-    final picked = await FilePicker.pickFile();
-    if (picked == null) return;
-    final path = picked.path;
-    if (path == null) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Could not open that file. Please pick another one.')),
-        );
-      }
-      return;
+  Future<void> _pickFiles() async {
+    final picked = await FilePicker.pickFiles();
+    if (picked.isEmpty) return;
+
+    final files = <File>[];
+    final names = <String>[];
+    final sizes = <int>[];
+    for (final p in picked) {
+      final path = p.path;
+      if (path == null) continue;
+      final f = File(path);
+      files.add(f);
+      names.add(p.name);
+      sizes.add(await f.length());
     }
-    final file = File(path);
-    final size = await file.length();
-    setState(() { _selectedFile = file; _fileName = picked.name; _fileSize = size; });
+    setState(() { _files = files; _names = names; _sizes = sizes; });
   }
 
-  void _sendFile() {
-    if (_selectedFile == null) return;
-    setState(() => _waiting = true);
+  void _sendFiles() {
+    if (_files.isEmpty) return;
+    setState(() => _isSending = true);
 
     _sendSub?.cancel();
     _sendSub = widget.transport.sendStateStream.listen((s) {
       if (!mounted) return;
       if (s == SendState.accepted) {
+        final first = _files.first;
         Navigator.of(context).pushReplacement(MaterialPageRoute(
           builder: (_) => ProgressScreen(
-            info: TransferInfo(name: _fileName, size: _formatBytes(_fileSize), bytes: _fileSize.toDouble(), sending: true),
+            info: TransferInfo(
+              name: first.path.split(Platform.pathSeparator).last,
+              size: _formatBytes(_sizes.first),
+              bytes: _sizes.first.toDouble(),
+              sending: true,
+            ),
             transport: widget.transport,
           ),
         ));
       } else if (s == SendState.declined) {
-        setState(() => _waiting = false);
+        setState(() => _isSending = false);
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('The laptop declined this file.')),
+          const SnackBar(content: Text('The laptop declined this transfer.')),
         );
       }
     });
 
-    widget.transport.sendFile(_selectedFile!);
+    widget.transport.sendMultipleFiles(_files);
   }
 
   String _formatBytes(int bytes) {
@@ -81,10 +83,12 @@ class _SendScreenState extends State<SendScreen> {
   @override
   Widget build(BuildContext context) {
     final text = Theme.of(context).textTheme;
+    final total = _sizes.fold<int>(0, (a, b) => a + b);
+
     return Scaffold(
       appBar: AppBar(
         backgroundColor: FlovaTokens.canvas, surfaceTintColor: Colors.transparent,
-        title: const Text('Send a file', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: FlovaTokens.ink)),
+        title: const Text('Send files', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: FlovaTokens.ink)),
       ),
       body: SafeArea(
         child: Center(
@@ -99,26 +103,50 @@ class _SendScreenState extends State<SendScreen> {
                   child: const Icon(Icons.description_outlined, size: 36, color: FlovaTokens.accent),
                 ),
                 const SizedBox(height: 16),
-                Text(_fileName.isEmpty ? 'No file selected' : _fileName, style: text.headlineMedium, textAlign: TextAlign.center),
-                if (_fileName.isNotEmpty) ...[
+                Text(_files.isEmpty ? 'No files selected' : '${_files.length} file${_files.length > 1 ? "s" : ""} selected',
+                    style: text.headlineMedium, textAlign: TextAlign.center),
+                if (_files.isNotEmpty) ...[
                   const SizedBox(height: 4),
-                  Text(_formatBytes(_fileSize), style: text.bodyMedium),
+                  Text('${_formatBytes(total)} total', style: text.bodyMedium),
+                  const SizedBox(height: 12),
+                  Container(
+                    width: double.infinity,
+                    constraints: const BoxConstraints(maxHeight: 200),
+                    decoration: BoxDecoration(color: FlovaTokens.surface, border: Border.all(color: FlovaTokens.line), borderRadius: BorderRadius.circular(FlovaTokens.rCard)),
+                    child: ListView.separated(
+                      shrinkWrap: true,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      itemCount: _files.length,
+                      separatorBuilder: (_, __) => const Divider(height: 1, color: FlovaTokens.line),
+                      itemBuilder: (context, i) => Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                        child: Row(children: [
+                          Expanded(
+                            child: Text(_names[i], maxLines: 1, overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(fontSize: 13, color: FlovaTokens.ink)),
+                          ),
+                          const SizedBox(width: 8),
+                          Text(_formatBytes(_sizes[i]), style: const TextStyle(fontSize: 12, color: FlovaTokens.ink3)),
+                        ]),
+                      ),
+                    ),
+                  ),
                 ],
                 const SizedBox(height: 24),
-                if (_fileName.isEmpty)
-                  SizedBox(width: double.infinity, child: FilledButton(onPressed: _pickFile, child: const Text('Browse files')))
+                if (_files.isEmpty)
+                  SizedBox(width: double.infinity, child: FilledButton(onPressed: _pickFiles, child: const Text('Browse files')))
                 else ...[
                   SizedBox(
                     width: double.infinity,
                     child: FilledButton(
-                      onPressed: _waiting ? null : _sendFile,
-                      child: Text(_waiting ? 'Waiting for laptop to accept…' : 'Send file'),
+                      onPressed: _isSending ? null : _sendFiles,
+                      child: Text(_isSending ? 'Starting...' : 'Send files'),
                     ),
                   ),
                   const SizedBox(height: 12),
                   SizedBox(
                     width: double.infinity,
-                    child: OutlinedButton(onPressed: _waiting ? null : () => Navigator.of(context).pop(), child: const Text('Cancel')),
+                    child: OutlinedButton(onPressed: _isSending ? null : () => Navigator.of(context).pop(), child: const Text('Cancel')),
                   ),
                 ],
               ],

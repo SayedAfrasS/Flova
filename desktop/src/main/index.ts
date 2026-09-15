@@ -1,104 +1,80 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. Creates the Electron main window and initializes the transport server.
- * 2. Sets up IPC bridges between main and renderer processes.
- * 3. Forwards transfer events from server to renderer via IPC.
- * 4. Handles app lifecycle events (ready, quit, etc.).
- *
- * FUNCTIONS:
- *  - createWindow()     : create the main browser window.
- *  - setupEventForwarding() : wire server events to IPC.
+ * 1. Main process entry point for the Electron app.
+ * 2. Detects the local IP address on the hotspot subnet (any non-internal IPv4).
+ * 3. Starts the TransportServer on port 8431.
+ * 4. Registers IPC handlers to bridge transport events to the renderer.
+ * 5. Creates the main BrowserWindow and loads the React app.
  */
+import { app, BrowserWindow } from 'electron'
+import * as os from 'os'
+import * as path from 'path'
+import { TransportServer } from './server/transport'
+import { registerIpc } from './ipc'
 
-import { app, BrowserWindow } from 'electron';
-import * as path from 'path';
-import { TransportServer } from './server/transport';
-import { setupIPC } from './ipc';
+let mainWindow: BrowserWindow | null = null
 
-let mainWindow: BrowserWindow | null = null;
-let server: TransportServer | null = null;
+function getLocalIP(): string {
+  const interfaces = os.networkInterfaces()
+  
+  // Priority order for interface names
+  const priority = ['Wi-Fi', 'Ethernet', 'en0', 'wlan0', 'eth0']
+  
+  // First try to find a hotspot-like interface
+  for (const name of priority) {
+    for (const iface of interfaces[name] || []) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        return iface.address
+      }
+    }
+  }
+  
+  // Fallback: any non-internal IPv4
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name] || []) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        return iface.address
+      }
+    }
+  }
+  
+  return '127.0.0.1'
+}
 
-function createWindow() {
+function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
-    minWidth: 800,
-    minHeight: 600,
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
     },
-  });
+  })
 
   if (process.env.NODE_ENV === 'development') {
-    mainWindow.loadURL('http://localhost:5173');
-    mainWindow.webContents.openDevTools();
+    mainWindow.loadURL('http://localhost:5173')
+    mainWindow.webContents.openDevTools()
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
+    mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'))
   }
-
-  mainWindow.on('closed', () => {
-    mainWindow = null;
-  });
-}
-
-function setupEventForwarding() {
-  if (!server || !mainWindow) return;
-
-  server.onPeerConnected = (peer) => {
-    mainWindow?.webContents.send('net:peer-connected', peer.name);
-  };
-
-  server.onPeerDisconnected = () => {
-    mainWindow?.webContents.send('net:peer-disconnected');
-  };
-
-  server.onSendAccepted = (id) => {
-    mainWindow?.webContents.send('file:send-accepted', id);
-  };
-
-  server.onSendDeclined = (id) => {
-    mainWindow?.webContents.send('file:send-declined', id);
-  };
-
-  server.onFileTransferStart = (meta) => {
-    mainWindow?.webContents.send('file:transfer-start', meta);
-  };
-
-  server.onFileProgress = (id, bytes, isSending) => {
-    mainWindow?.webContents.send('file:progress', id, bytes, isSending);
-  };
-
-  server.onFileDone = (id, name, isSending, verified) => {
-    mainWindow?.webContents.send('file:done', id, name, isSending, verified);
-  };
-
-  server.onIncomingOffer = (id, name, size) => {
-    mainWindow?.webContents.send('file:incoming-offer', id, name, size);
-  };
 }
 
 app.whenReady().then(() => {
-  server = new TransportServer(8431);
-  createWindow();
-  setupEventForwarding();
-  setupIPC(server);
+  const port = 8431
+  const host = getLocalIP()
+  const server = new TransportServer(port, 'Desktop')
+  registerIpc(server, () => ({ host, port }))
+
+  console.log(`Server listening on ${host}:${port}`)
+
+  createWindow()
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-    }
-  });
-});
+    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+  })
+})
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    server?.shutdown();
-    app.quit();
-  }
-});
-
-app.on('before-quit', () => {
-  server?.shutdown();
-});
+  if (process.platform !== 'darwin') app.quit()
+})

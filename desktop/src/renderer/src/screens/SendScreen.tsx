@@ -1,11 +1,12 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. User picks a file; real name/size are read from disk via IPC.
- * 2. "Send file" sends a file-offer and waits for the phone to accept.
- * 3. On accept, navigates to the Progress screen (bytes start flowing then).
- * 4. On decline, shows the decline state and re-enables the button.
+ * 1. Lets the user pick one or multiple files using the native OS dialog.
+ * 2. Shows the selected files with names and sizes.
+ * 3. "Send files" queues them via sendMultipleFiles IPC and navigates to
+ *    the Progress screen for the first file.
+ * 4. The Progress screen tracks per-file progress and queue advancement.
  */
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Button } from "../components/primitives";
 import { useNav } from "../state/nav";
 
@@ -17,38 +18,28 @@ function formatBytes(bytes: number): string {
 
 export function SendScreen() {
   const go = useNav((s) => s.go);
-  const [filePath, setFilePath] = useState<string | null>(null);
-  const [fileName, setFileName] = useState("");
-  const [fileSize, setFileSize] = useState(0);
-  const [waiting, setWaiting] = useState(false);
-  const [declined, setDeclined] = useState(false);
-
-  useEffect(() => {
-    if (!window.flova) return;
-    const offAccepted = window.flova.onSendAccepted(() => go("progress"));
-    const offDeclined = window.flova.onSendDeclined(() => {
-      setWaiting(false);
-      setDeclined(true);
-    });
-    return () => { offAccepted(); offDeclined(); };
-  }, [go]);
+  const [files, setFiles] = useState<{ path: string; name: string; size: number }[]>([]);
+  const [isSending, setIsSending] = useState(false);
 
   const handlePick = async () => {
     if (!window.flova) return;
-    const picked = await window.flova.pickFile();
-    if (picked) {
-      setFilePath(picked);
-      setDeclined(false);
-      const stats = await window.flova.getFileStats(picked);
-      if (stats) { setFileName(stats.name); setFileSize(stats.size); }
+    const picked = await window.flova.pickMultipleFiles();
+    if (picked && picked.length > 0) {
+      const stats = await Promise.all(
+        picked.map(async (p) => {
+          const s = await window.flova.getFileStats(p);
+          return s ? { path: p, name: s.name, size: s.size } : null;
+        })
+      );
+      setFiles(stats.filter(Boolean) as { path: string; name: string; size: number }[]);
     }
   };
 
   const handleSend = async () => {
-    if (!filePath || !window.flova) return;
-    setWaiting(true);
-    setDeclined(false);
-    await window.flova.sendFile(filePath);
+    if (files.length === 0 || !window.flova) return;
+    setIsSending(true);
+    await window.flova.sendMultipleFiles(files.map((f) => f.path));
+    go("progress");
   };
 
   return (
@@ -58,22 +49,30 @@ export function SendScreen() {
       </div>
 
       <div className="text-center">
-        <h1 className="text-[20px] font-semibold tracking-tight text-ink">{fileName || "No file selected"}</h1>
-        {fileName && <p className="mt-1 text-[13px] text-ink-2">{formatBytes(fileSize)}</p>}
+        <h1 className="text-[20px] font-semibold tracking-tight text-ink">
+          {files.length === 0 ? "No files selected" : `${files.length} file${files.length > 1 ? "s" : ""} selected`}
+        </h1>
+        {files.length > 0 && <p className="mt-1 text-[13px] text-ink-2">{formatBytes(files.reduce((s, f) => s + f.size, 0))} total</p>}
       </div>
 
-      {declined && (
-        <p className="text-[13px] text-error">The phone declined this file.</p>
+      {files.length > 0 && (
+        <div className="w-full max-h-48 overflow-y-auto rounded-card border border-line bg-surface p-3 space-y-2">
+          {files.map((f) => (
+            <div key={f.path} className="text-[13px] text-ink-2 truncate">
+              {f.name} · {formatBytes(f.size)}
+            </div>
+          ))}
+        </div>
       )}
 
-      {!fileName ? (
+      {files.length === 0 ? (
         <Button onClick={handlePick} className="w-full">Browse files</Button>
       ) : (
         <div className="flex w-full flex-col gap-2">
-          <Button onClick={handleSend} disabled={waiting}>
-            {waiting ? "Waiting for phone to accept…" : "Send file"}
+          <Button onClick={handleSend} disabled={isSending}>
+            {isSending ? "Starting..." : "Send files"}
           </Button>
-          <Button variant="secondary" onClick={() => go("home")} disabled={waiting}>Cancel</Button>
+          <Button variant="secondary" onClick={() => go("home")}>Cancel</Button>
         </div>
       )}
     </div>

@@ -1,8 +1,8 @@
 /**
  * WORKFLOW OF THIS FILE:
  * 1. Declares the window.flova API types for strict renderer type checking.
- * 2. Transfer metadata includes verified (hash verdict) and resumed (bytes
- *    already transferred before a reconnect) for the resume feature.
+ * 2. Includes queue management methods: pickMultiple, sendMultiple,
+ *    cancelQueue, getQueueInfo, and the queue-advance event.
  */
 export {}
 
@@ -16,8 +16,12 @@ declare global {
       onPeerDisconnected: (cb: () => void) => () => void
 
       pickFile: () => Promise<string | null>
+      pickMultipleFiles: () => Promise<string[]>
       getFileStats: (path: string) => Promise<{ name: string; size: number } | null>
       sendFile: (path: string) => Promise<boolean>
+      sendMultipleFiles: (paths: string[]) => Promise<boolean>
+      cancelQueue: () => Promise<boolean>
+      getQueueInfo: () => Promise<{ queue: { filePath: string; name: string; size: number }[]; currentIndex: number }>
       onSendAccepted: (cb: () => void) => () => void
       onSendDeclined: (cb: () => void) => () => void
 
@@ -31,6 +35,7 @@ declare global {
       onFileTransferStart: (cb: (m: { name: string; size: number; isSending: boolean; resumed?: number }) => void) => () => void
       onFileProgress: (cb: (d: { bytes: number; isSending: boolean }) => void) => () => void
       onFileDone: (cb: (d: { name: string; isSending: boolean; verified: boolean }) => void) => () => void
+      onQueueAdvance: (cb: (d: { completed: number; total: number }) => void) => () => void
     }
   }
 }
