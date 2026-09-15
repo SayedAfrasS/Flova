@@ -1,10 +1,17 @@
+/// WORKFLOW OF THIS FILE:
+/// 1. Mobile home shell: bottom navigation with three tabs
+///    (Home, Transfers, Settings).
+/// 2. Transfers tab is history-only (TransfersScreen has no live state).
+/// 3. Records every finished transfer into SQLite history (HistoryStore).
+/// 4. Incoming offers push the Receive screen; resume events push Progress.
+/// 5. Connection overlay handles reconnecting / lost / checking states.
 import 'dart:async';
 import 'package:flutter/material.dart';
 import '../core/flova_mark.dart';
 import '../core/tokens.dart';
 import '../core/transfer.dart';
+import '../services/history_store.dart';
 import '../services/transport.dart';
-import 'history_screen.dart';
 import 'progress_screen.dart';
 import 'receive_screen.dart';
 import 'send_screen.dart';
@@ -101,6 +108,8 @@ class _HomeScreenState extends State<HomeScreen> {
         ));
       } else if (event.isDone) {
         _resumePushed = false;
+        // persist into real history
+        HistoryStore.record(event.name, event.size, event.sending ? 'sent' : 'received', event.ok);
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(event.ok ? 'Saved: ${event.name}' : 'Failed: ${event.name} arrived damaged'),
@@ -138,9 +147,6 @@ class _HomeScreenState extends State<HomeScreen> {
       case 1:
         bodyContent = const TransfersScreen();
         break;
-      case 2:
-        bodyContent = const HistoryScreen();
-        break;
       default:
         bodyContent = const SettingsScreen();
     }
@@ -164,7 +170,6 @@ class _HomeScreenState extends State<HomeScreen> {
         destinations: const [
           NavigationDestination(icon: Icon(Icons.home_outlined), selectedIcon: Icon(Icons.home), label: 'Home'),
           NavigationDestination(icon: Icon(Icons.sync_alt), label: 'Transfers'),
-          NavigationDestination(icon: Icon(Icons.history), label: 'History'),
           NavigationDestination(icon: Icon(Icons.settings_outlined), selectedIcon: Icon(Icons.settings), label: 'Settings'),
         ],
       ),
@@ -276,43 +281,8 @@ class _HomeScreenState extends State<HomeScreen> {
               label: const Text('Receive a file'),
             ),
           ),
-          const SizedBox(height: 40),
-          Text('Recent transfers', style: textTheme.headlineMedium?.copyWith(fontSize: 18)),
-          const SizedBox(height: 16),
-          _buildTransferItem('document.pdf', '2.4 MB', 'Today, 10:42 AM'),
-          const Divider(height: 1, color: FlovaTokens.line),
-          _buildTransferItem('presentation.key', '14.1 MB', 'Yesterday'),
-          const Divider(height: 1, color: FlovaTokens.line),
-          _buildTransferItem('vacation_video.mp4', '1.8 GB', 'Sep 5'),
         ],
       ),
-    );
-  }
-
-  Widget _buildTransferItem(String name, String size, String time) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 12),
-      child: Row(children: [
-        Container(
-          width: 36,
-          height: 36,
-          decoration: BoxDecoration(color: FlovaTokens.section, borderRadius: BorderRadius.circular(FlovaTokens.rControl)),
-          child: const Icon(Icons.description_outlined, color: FlovaTokens.ink2, size: 18),
-        ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(name, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: FlovaTokens.ink)),
-            const SizedBox(height: 2),
-            Text(size, style: const TextStyle(fontSize: 12, color: FlovaTokens.ink3)),
-          ]),
-        ),
-        Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
-          Text(time, style: const TextStyle(fontSize: 12, color: FlovaTokens.ink3)),
-          const SizedBox(height: 2),
-          const Text('Completed', style: TextStyle(fontSize: 12, color: FlovaTokens.success, fontWeight: FontWeight.w500)),
-        ]),
-      ]),
     );
   }
 }
