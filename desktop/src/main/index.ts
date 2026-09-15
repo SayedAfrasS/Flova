@@ -1,10 +1,10 @@
 /**
  * WORKFLOW OF THIS FILE:
  * 1. Main process entry point for the Electron app.
- * 2. Detects the local IP address on the hotspot subnet (any non-internal IPv4).
- * 3. Starts the TransportServer on port 8431.
- * 4. Registers IPC handlers to bridge transport events to the renderer.
- * 5. Creates the main BrowserWindow and loads the React app.
+ * 2. Detects the local IP on the active Wi-Fi/Ethernet interface.
+ * 3. Starts the TransportServer on port 8431 and registers IPC handlers.
+ * 4. Creates the main window and loads the React renderer.
+ * 5. DevTools do NOT open automatically; press F12 manually if needed.
  */
 import { app, BrowserWindow } from 'electron'
 import * as os from 'os'
@@ -16,28 +16,22 @@ let mainWindow: BrowserWindow | null = null
 
 function getLocalIP(): string {
   const interfaces = os.networkInterfaces()
-  
-  // Priority order for interface names
+
+  // preferred interface names first
   const priority = ['Wi-Fi', 'Ethernet', 'en0', 'wlan0', 'eth0']
-  
-  // First try to find a hotspot-like interface
   for (const name of priority) {
     for (const iface of interfaces[name] || []) {
-      if (iface.family === 'IPv4' && !iface.internal) {
-        return iface.address
-      }
+      if (iface.family === 'IPv4' && !iface.internal) return iface.address
     }
   }
-  
-  // Fallback: any non-internal IPv4
+
+  // fallback: any non-internal IPv4 address
   for (const name of Object.keys(interfaces)) {
     for (const iface of interfaces[name] || []) {
-      if (iface.family === 'IPv4' && !iface.internal) {
-        return iface.address
-      }
+      if (iface.family === 'IPv4' && !iface.internal) return iface.address
     }
   }
-  
+
   return '127.0.0.1'
 }
 
@@ -45,6 +39,7 @@ function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
+    title: 'Flova',
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -52,12 +47,18 @@ function createWindow(): void {
     },
   })
 
-  if (process.env.NODE_ENV === 'development') {
-    mainWindow.loadURL('http://localhost:5173')
-    mainWindow.webContents.openDevTools()
+  if (process.env.NODE_ENV === 'development' || process.env['ELECTRON_RENDERER_URL']) {
+    // dev: load from the vite dev server (no DevTools auto-open)
+    const url = process.env['ELECTRON_RENDERER_URL'] || 'http://localhost:5173'
+    mainWindow.loadURL(url)
   } else {
+    // production: load the built renderer files
     mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'))
   }
+
+  mainWindow.on('closed', () => {
+    mainWindow = null
+  })
 }
 
 app.whenReady().then(() => {
@@ -66,7 +67,7 @@ app.whenReady().then(() => {
   const server = new TransportServer(port, 'Desktop')
   registerIpc(server, () => ({ host, port }))
 
-  console.log(`Server listening on ${host}:${port}`)
+  console.log(`[main] server listening on ${host}:${port}`)
 
   createWindow()
 
