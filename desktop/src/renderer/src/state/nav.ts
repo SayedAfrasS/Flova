@@ -1,29 +1,26 @@
-import { create } from "zustand";
+/**
+ * WORKFLOW OF THIS FILE:
+ * 1. Single zustand store holding the current screen id.
+ * 2. History is no longer a screen: it lives inside the Transfers page.
+ */
+import { create } from 'zustand'
 
 export type Screen =
-  | "connect" | "home" | "send" | "receive" | "progress"
-  | "complete" | "queue" | "history" | "settings";
-
-export type Direction = "send" | "receive";
-
-export interface FileInfo {
-  name: string;
-  size: string;
-  bytes: number;
-}
+  | 'connect'
+  | 'home'
+  | 'send'
+  | 'receive'
+  | 'progress'
+  | 'complete'
+  | 'transfers'
+  | 'settings'
 
 type NavState = {
-  screen: Screen;
-  direction: Direction;
-  file: FileInfo;
-  go: (screen: Screen) => void;
-  startTransfer: (direction: Direction, file: FileInfo) => void;
-};
+  screen: Screen
+  go: (s: Screen) => void
+}
 
 export const useNav = create<NavState>((set) => ({
-  screen: "connect",
-  direction: "send",
-  file: { name: "Vacation Video.mp4", size: "1.8 GB", bytes: 1.8 * 1024 ** 3 },
+  screen: 'connect',
   go: (screen) => set({ screen }),
-  startTransfer: (direction, file) => set({ direction, file, screen: "progress" }),
-}));
+}))

@@ -1,21 +1,21 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. Root of the desktop UI: picks the screen from the nav store.
- * 2. Global watchers: incoming offer jumps to Receive; transfer start (including
- *    resume) jumps to Progress while on Home.
+ * 1. Root of the desktop UI: maps screen ids to components.
+ * 2. Global watchers: incoming offer jumps to Receive while on Home, and any
+ *    transfer start jumps to Progress while on Home.
+ * 3. History is rendered inside TransfersScreen, not as its own screen.
  */
-import { useEffect, type ComponentType } from "react";
-import { useNav, type Screen } from "./state/nav";
-import { ConnectScreen } from "./screens/ConnectScreen";
-import { HomeScreen } from "./screens/HomeScreen";
-import { SendScreen } from "./screens/SendScreen";
-import { ReceiveScreen } from "./screens/ReceiveScreen";
-import { ProgressScreen } from "./screens/ProgressScreen";
-import { CompleteScreen } from "./screens/CompleteScreen";
-import { QueueScreen } from "./screens/QueueScreen";
-import { HistoryScreen } from "./screens/HistoryScreen";
-import { SettingsScreen } from "./screens/SettingsScreen";
-import { Sidebar } from "./components/Sidebar";
+import { useEffect, type ComponentType } from 'react'
+import { useNav, type Screen } from './state/nav'
+import { ConnectScreen } from './screens/ConnectScreen'
+import { HomeScreen } from './screens/HomeScreen'
+import { SendScreen } from './screens/SendScreen'
+import { ReceiveScreen } from './screens/ReceiveScreen'
+import { ProgressScreen } from './screens/ProgressScreen'
+import { CompleteScreen } from './screens/CompleteScreen'
+import { TransfersScreen } from './screens/TransfersScreen'
+import { SettingsScreen } from './screens/SettingsScreen'
+import { Sidebar } from './components/Sidebar'
 
 const SCREENS: Record<Screen, ComponentType> = {
   connect: ConnectScreen,
@@ -24,28 +24,30 @@ const SCREENS: Record<Screen, ComponentType> = {
   receive: ReceiveScreen,
   progress: ProgressScreen,
   complete: CompleteScreen,
-  queue: QueueScreen,
-  history: HistoryScreen,
+  transfers: TransfersScreen,
   settings: SettingsScreen,
-};
+}
 
 export default function App() {
-  const screen = useNav((s) => s.screen);
-  const CurrentScreen = SCREENS[screen];
+  const screen = useNav((s) => s.screen)
+  const CurrentScreen = SCREENS[screen]
 
   useEffect(() => {
     const offOffer = window.flova?.onIncomingOffer(() => {
-      const nav = useNav.getState();
-      if (nav.screen === "home") nav.go("receive");
-    });
+      const nav = useNav.getState()
+      if (nav.screen === 'home') nav.go('receive')
+    })
     const offStart = window.flova?.onFileTransferStart(() => {
-      const nav = useNav.getState();
-      if (nav.screen === "home") nav.go("progress");
-    });
-    return () => { offOffer?.(); offStart?.(); };
-  }, []);
+      const nav = useNav.getState()
+      if (nav.screen === 'home') nav.go('progress')
+    })
+    return () => {
+      offOffer?.()
+      offStart?.()
+    }
+  }, [])
 
-  if (screen === "connect") return <ConnectScreen />;
+  if (screen === 'connect') return <ConnectScreen />
 
   return (
     <div className="flex h-full">
@@ -54,5 +56,5 @@ export default function App() {
         <CurrentScreen />
       </main>
     </div>
-  );
+  )
 }
