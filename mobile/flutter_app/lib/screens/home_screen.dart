@@ -1,10 +1,12 @@
 /// WORKFLOW OF THIS FILE:
-/// 1. Mobile home shell: bottom navigation with three tabs
-///    (Home, Transfers, Settings).
-/// 2. Transfers tab is history-only (TransfersScreen has no live state).
-/// 3. Records every finished transfer into SQLite history (HistoryStore).
-/// 4. Incoming offers push the Receive screen; resume events push Progress.
-/// 5. Connection overlay handles reconnecting / lost / checking states.
+/// 1. Mobile home shell: bottom navigation with three tabs (Home, Transfers, Settings).
+/// 2. When paired, displays the session fingerprint badge under the peer name.
+///    Both devices show the same 8-character code when the encrypted session
+///    is healthy, giving the user a visual way to verify no MITM is present.
+/// 3. Transfers tab shows history only (TransfersScreen).
+/// 4. Records every finished transfer into SQLite history (HistoryStore).
+/// 5. Incoming offers push the Receive screen; resume events push Progress.
+/// 6. Connection overlay handles reconnecting / lost / checking states.
 import 'dart:async';
 import 'package:flutter/material.dart';
 import '../core/flova_mark.dart';
@@ -36,6 +38,7 @@ class _HomeScreenState extends State<HomeScreen> {
   StreamSubscription<TransportState>? _stateSub;
   StreamSubscription<FileEvent>? _fileSub;
   Timer? _checkingTimer;
+  Timer? _fingerprintPoll;
 
   @override
   void initState() {
@@ -108,7 +111,6 @@ class _HomeScreenState extends State<HomeScreen> {
         ));
       } else if (event.isDone) {
         _resumePushed = false;
-        // persist into real history
         HistoryStore.record(event.name, event.size, event.sending ? 'sent' : 'received', event.ok);
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -125,6 +127,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _stateSub?.cancel();
     _fileSub?.cancel();
     _checkingTimer?.cancel();
+    _fingerprintPoll?.cancel();
     widget.transport.dispose();
     super.dispose();
   }
@@ -232,6 +235,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _buildHomeContent(BuildContext context, TextTheme textTheme) {
     final isConnected = _state == TransportState.paired;
+    final fingerprint = widget.transport.fingerprint;
     return SingleChildScrollView(
       padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
       child: Column(
@@ -250,6 +254,23 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(width: 6),
             Text(widget.peerName, style: textTheme.bodyLarge?.copyWith(color: FlovaTokens.ink2)),
           ]),
+          if (isConnected && fingerprint.isNotEmpty && fingerprint != '----') ...[
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: FlovaTokens.surface,
+                border: Border.all(color: FlovaTokens.line),
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                const Icon(Icons.lock_outline, size: 14, color: FlovaTokens.success),
+                const SizedBox(width: 6),
+                Text('Encrypted · $fingerprint',
+                    style: const TextStyle(fontSize: 12, fontFamily: 'monospace', color: FlovaTokens.ink2)),
+              ]),
+            ),
+          ],
           const SizedBox(height: 32),
           SizedBox(
             width: double.infinity,
