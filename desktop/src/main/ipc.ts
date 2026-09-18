@@ -3,8 +3,8 @@
  * 1. Bridges TransportServer events to the renderer via IPC.
  * 2. Records every finished transfer into SQLite history (recordTransfer).
  * 3. Exposes history:list so the Transfers page can read real rows.
- * 4. Keeps a name->size map so history rows include the file size.
- * 5. Provides getProgress to read current bytes from the transport layer.
+ * 4. Exposes net:getFingerprint so the Home screen can show the session
+ *    fingerprint and let the user visually verify the encrypted session.
  */
 import { ipcMain, BrowserWindow, dialog } from 'electron'
 import * as fs from 'fs'
@@ -38,6 +38,7 @@ export function registerIpc(server: TransportServer, getInfo: () => { host: stri
   ipcMain.handle('net:getServer', () => getInfo())
   ipcMain.handle('net:getState', () => (peer ? 'paired' : 'waiting'))
   ipcMain.handle('net:getPeerName', () => peer?.name ?? null)
+  ipcMain.handle('net:getFingerprint', () => server.getFingerprint())
 
   ipcMain.handle('file:pick', async () => {
     const result = await dialog.showOpenDialog({ properties: ['openFile'] })
@@ -68,10 +69,5 @@ export function registerIpc(server: TransportServer, getInfo: () => { host: stri
   ipcMain.handle('file:declineIncoming', () => { server.declineIncoming(); return true })
   ipcMain.handle('file:getCurrentTransfer', () => server.getCurrentTransfer())
   ipcMain.handle('file:getLastTransfer', () => server.getLastTransfer())
-  ipcMain.handle('file:getProgress', () => {
-    const t = server.getCurrentTransfer()
-    if (!t) return null
-    return { bytes: t.resumed ?? 0, isSending: t.isSending }
-  })
   ipcMain.handle('history:list', () => listTransfers())
 }

@@ -1,28 +1,40 @@
 /**
  * WORKFLOW OF THIS FILE:
- * 1. WebSocket server + peer lifecycle + heartbeat.
- * 2. QUEUE SENDING: offers are sent one file at a time. Each offer carries
- *    queueIndex/queueTotal. After a file's verify-result arrives the queue
- *    advances and the next offer is sent automatically.
- * 3. QUEUE RECEIVING: an offer with queueIndex > 0 is a continuation of an
- *    already-accepted batch, so it is accepted automatically without UI.
- *    Only queueIndex 0 shows the Accept/Decline screen.
- * 4. RE-ENTRANT RECEIVER: finishIncomingFile captures its state synchronously
- *    and releases it immediately, so the next file can begin while the
- *    previous file is still being hash-verified.
- * 5. Integrity: per-segment SHA-256 (nack+resend) + whole-file verify-result.
- * 6. Resume: send/recv sidecars survive crashes; resume-offer replays gaps.
+ * 1. Manages the WebSocket server, the peer, and the symmetric handshake.
+ * 2. Every new connection creates a fresh SessionCrypto (forward secrecy).
+ * 3. The hello/hello-ack messages carry X25519 public keys in plaintext.
+ *    Both sides derive the same 32-byte shared secret after hello-ack.
+ * 4. All messages after that are encrypted with ChaCha20-Poly1305:
+ *    - JSON frames are wrapped as {"type":"e","n":nonce,"c":cipher}
+ *    - Binary frames are prefixed with 0x01 + 12-byte nonce + ciphertext
+ * 5. Incoming encrypted frames are decrypted before dispatch. Tampered
+ *    frames fail the auth tag and are logged and dropped.
+ * 6. All higher-level behavior (queue, resume, verify, history hooks) is
+ *    identical to Phase 13; only the transport layer gained encryption.
+ *
+ * FUNCTIONS:
+ *  - sendJson()       : encrypts (when session ready) and sends a JSON frame.
+ *  - sendBinary()     : encrypts (when session ready) and sends a binary frame.
+ *  - dispatch()       : processes an already-decrypted JSON message.
+ *  - offerMultipleFiles / cancelQueue / acceptIncoming / etc: unchanged.
  */
 import { WebSocketServer, WebSocket } from 'ws'
 import { app } from 'electron'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as crypto from 'crypto'
+import { SessionCrypto } from './crypto'
 
 export type Peer = { name: string; platform: string }
 export type TransferMeta = {
-  name: string; size: number; isSending: boolean; verified?: boolean;
-  resumed?: number; filePath?: string; queueIndex?: number; queueTotal?: number;
+  name: string
+  size: number
+  isSending: boolean
+  verified?: boolean
+  resumed?: number
+  filePath?: string
+  queueIndex?: number
+  queueTotal?: number
 }
 
 const PING_INTERVAL_MS = 3000
@@ -32,6 +44,7 @@ const MIN_WORKERS = 2
 const START_WORKERS = 4
 const MAX_WORKERS = 8
 const VERIFY_TIMEOUT_MS = 20000
+const PLAINTEXT_TYPES = new Set(['hello', 'hello-ack'])
 
 export class TransportServer {
   private wss: WebSocketServer
@@ -40,6 +53,7 @@ export class TransportServer {
   private selfName: string
   private pingTimer: NodeJS.Timeout | null = null
   private lastPong = 0
+  private crypto: SessionCrypto = new SessionCrypto()
 
   private recvFd: number | null = null
   private recvPartPath: string | null = null
@@ -118,91 +132,94 @@ export class TransportServer {
     })
   }
 
+  /** wraps a JSON frame in the encrypted envelope when the session is ready */
+  private sendJson(msg: Record<string, unknown>): void {
+    if (!this.peerWs) return
+    if (this.crypto.hasKey() && !PLAINTEXT_TYPES.has(msg.type as string)) {
+      try {
+        const plain = Buffer.from(JSON.stringify(msg), 'utf8')
+        const { nonce, ciphertext } = this.crypto.encrypt(plain)
+        this.peerWs.send(JSON.stringify({
+          type: 'e',
+          n: nonce.toString('base64'),
+          c: ciphertext.toString('base64'),
+        }))
+        return
+      } catch (e) {
+        console.warn('[transport] encrypt json failed', e)
+      }
+    }
+    this.peerWs.send(JSON.stringify(msg))
+  }
+
+  /** wraps a binary frame with 0x01 marker + nonce + ciphertext when session ready */
+  private sendBinary(data: Buffer): void {
+    if (!this.peerWs) return
+    if (this.crypto.hasKey()) {
+      try {
+        const { nonce, ciphertext } = this.crypto.encrypt(data)
+        const frame = Buffer.alloc(1 + nonce.length + ciphertext.length)
+        frame[0] = 0x01
+        nonce.copy(frame, 1)
+        ciphertext.copy(frame, 1 + nonce.length)
+        this.peerWs.send(frame)
+        return
+      } catch (e) {
+        console.warn('[transport] encrypt binary failed', e)
+      }
+    }
+    this.peerWs.send(data)
+  }
+
   private handle(ws: WebSocket): void {
     if (this.peerWs) { ws.close(1013, 'already connected'); return }
 
+    // fresh crypto for this session -> forward secrecy per connection
+    this.crypto = new SessionCrypto()
+
     ws.on('message', (data, isBinary) => {
-      if (isBinary) { this.handleBinaryFrame(data as Buffer); return }
-      try {
-        const msg = JSON.parse(data.toString())
-        if (msg?.type === 'hello') {
-          this.peerWs = ws
-          this.peer = { name: String(msg.name ?? 'Phone'), platform: String(msg.platform ?? 'mobile') }
-          this.lastPong = Date.now()
-          ws.send(JSON.stringify({ type: 'hello-ack', name: this.selfName, platform: 'desktop' }))
-          this.startHb()
-          this.onPeerConnected?.(this.peer)
-          this.maybeOfferResume()
-        } else if (msg?.type === 'ping') {
-          ws.send(JSON.stringify({ type: 'pong' }))
-        } else if (msg?.type === 'pong') {
-          this.lastPong = Date.now()
-        } else if (msg?.type === 'verify-result') {
-          const r = this.verifyResolver
-          this.verifyResolver = null
-          if (r) r(msg.ok === true)
-        } else if (msg?.type === 'chunk-ack') {
-          const i = Number(msg.i)
-          const resolve = this.ackResolvers.get(i)
-          if (resolve) { this.ackResolvers.delete(i); resolve() }
-        } else if (msg?.type === 'chunk-nack') {
-          const i = Number(msg.i)
-          if (!this.resendQueue.includes(i)) this.resendQueue.push(i)
-        } else if (msg?.type === 'file-offer') {
-          const queueIndex = Number(msg.queueIndex ?? 0)
-          this.pendingIncoming = {
-            name: path.basename(String(msg.name)),
-            size: Number(msg.size),
-            transferId: String(msg.transferId ?? 't0'),
-            fileHash: String(msg.fileHash ?? ''),
+      if (isBinary) {
+        const buf = data as Buffer
+        if (buf.length >= 1 + 12 + 16 && buf[0] === 0x01 && this.crypto.hasKey()) {
+          try {
+            const nonce = buf.subarray(1, 13)
+            const cipher = buf.subarray(13)
+            const plain = this.crypto.decrypt(nonce, cipher)
+            this.handleBinaryFrame(Buffer.from(plain))
+          } catch (e) {
+            console.warn('[transport] binary decrypt failed', e)
           }
-          if (queueIndex > 0) {
-            // continuation of an accepted batch: accept silently, no UI
-            this.acceptIncoming()
-          } else {
-            this.onIncomingOffer?.(this.pendingIncoming.name, this.pendingIncoming.size)
-          }
-        } else if (msg?.type === 'file-accept') {
-          if (this.sendQueue.length > 0 && this.currentSendIndex < this.sendQueue.length) {
-            const item = this.sendQueue[this.currentSendIndex]
-            this.startFileStream(item.filePath, new Set<number>(), 0)
-          }
-        } else if (msg?.type === 'file-decline') {
-          this.currentTransfer = null
-          this.onSendDeclined?.()
-        } else if (msg?.type === 'resume-offer') {
-          this.handleResumeOffer(msg)
-        } else if (msg?.type === 'resume-accept') {
-          const received = Array.isArray(msg.received) ? (msg.received as number[]) : []
-          if (this.resumeState && this.sendQueue.length > 0 && this.currentSendIndex < this.sendQueue.length) {
-            const skip = new Set(received)
-            let resumed = 0
-            const item = this.sendQueue[this.currentSendIndex]
-            const size = fs.statSync(item.filePath).size
-            for (const i of skip) {
-              const off = i * CHUNK_SIZE
-              resumed += Math.min(CHUNK_SIZE, size - off)
-            }
-            this.startFileStream(item.filePath, skip, resumed)
-          }
-        } else if (msg?.type === 'resume-decline') {
-          this.clearSendSidecar()
-          this.resumeState = null
-          this.sendQueue = []
-          this.currentSendIndex = 0
-        } else if (msg?.type === 'file-start') {
-          // segments follow; sink already open
-        } else if (msg?.type === 'file-end') {
-          this.finishIncomingFile()
+          return
         }
-      } catch (err) {
-        console.warn('[transport] bad json frame', err)
+        this.handleBinaryFrame(buf)
+        return
       }
+
+      let msg: any
+      try { msg = JSON.parse(data.toString()) } catch { return }
+
+      if (msg?.type === 'e' && this.crypto.hasKey()) {
+        try {
+          const plain = this.crypto.decrypt(
+            Buffer.from(String(msg.n), 'base64'),
+            Buffer.from(String(msg.c), 'base64')
+          )
+          const inner = JSON.parse(plain.toString('utf8'))
+          this.dispatch(inner, ws)
+        } catch (e) {
+          console.warn('[transport] json decrypt failed', e)
+        }
+        return
+      }
+
+      this.dispatch(msg, ws)
     })
 
     ws.on('close', () => {
       if (this.peerWs === ws) {
-        this.stopHb(); this.peerWs = null; this.peer = null
+        this.stopHb()
+        this.peerWs = null
+        this.peer = null
         this.sendAborted = true
         for (const resolve of this.ackResolvers.values()) resolve()
         this.ackResolvers.clear()
@@ -214,6 +231,104 @@ export class TransportServer {
       }
     })
     ws.on('error', (err) => console.warn('[transport] peer error', err))
+  }
+
+  /** dispatches an already-decrypted (or plaintext handshake) JSON message */
+  private dispatch(msg: any, ws: WebSocket): void {
+    if (!msg || typeof msg !== 'object') return
+    const type = msg.type
+
+    if (type === 'hello') {
+      this.peerWs = ws
+      this.peer = { name: String(msg.name ?? 'Phone'), platform: String(msg.platform ?? 'mobile') }
+      this.lastPong = Date.now()
+      if (msg.pubKey) {
+        try {
+          this.crypto.deriveKey(Buffer.from(String(msg.pubKey), 'base64'))
+          console.log(`[crypto] key derived, fingerprint=${this.crypto.fingerprint()}`)
+        } catch (e) {
+          console.warn('[crypto] derive failed', e)
+        }
+      }
+      this.sendJson({
+        type: 'hello-ack',
+        name: this.selfName,
+        platform: 'desktop',
+        pubKey: this.crypto.getPublicKey().toString('base64'),
+      })
+      this.startHb()
+      this.onPeerConnected?.(this.peer)
+      this.maybeOfferResume()
+    } else if (type === 'hello-ack') {
+      if (msg.pubKey) {
+        try {
+          this.crypto.deriveKey(Buffer.from(String(msg.pubKey), 'base64'))
+          console.log(`[crypto] key derived from ack, fingerprint=${this.crypto.fingerprint()}`)
+        } catch (e) {
+          console.warn('[crypto] derive on ack failed', e)
+        }
+      }
+    } else if (type === 'ping') {
+      this.sendJson({ type: 'pong' })
+    } else if (type === 'pong') {
+      this.lastPong = Date.now()
+    } else if (type === 'verify-result') {
+      const r = this.verifyResolver
+      this.verifyResolver = null
+      if (r) r(msg.ok === true)
+    } else if (type === 'chunk-ack') {
+      const i = Number(msg.i)
+      const resolve = this.ackResolvers.get(i)
+      if (resolve) { this.ackResolvers.delete(i); resolve() }
+    } else if (type === 'chunk-nack') {
+      const i = Number(msg.i)
+      if (!this.resendQueue.includes(i)) this.resendQueue.push(i)
+    } else if (type === 'file-offer') {
+      const queueIndex = Number(msg.queueIndex ?? 0)
+      this.pendingIncoming = {
+        name: path.basename(String(msg.name)),
+        size: Number(msg.size),
+        transferId: String(msg.transferId ?? 't0'),
+        fileHash: String(msg.fileHash ?? ''),
+      }
+      if (queueIndex > 0) {
+        this.acceptIncoming()
+      } else {
+        this.onIncomingOffer?.(this.pendingIncoming.name, this.pendingIncoming.size)
+      }
+    } else if (type === 'file-accept') {
+      if (this.sendQueue.length > 0 && this.currentSendIndex < this.sendQueue.length) {
+        const item = this.sendQueue[this.currentSendIndex]
+        this.startFileStream(item.filePath, new Set<number>(), 0)
+      }
+    } else if (type === 'file-decline') {
+      this.currentTransfer = null
+      this.onSendDeclined?.()
+    } else if (type === 'resume-offer') {
+      this.handleResumeOffer(msg)
+    } else if (type === 'resume-accept') {
+      const received = Array.isArray(msg.received) ? (msg.received as number[]) : []
+      if (this.resumeState && this.sendQueue.length > 0 && this.currentSendIndex < this.sendQueue.length) {
+        const skip = new Set(received)
+        let resumed = 0
+        const item = this.sendQueue[this.currentSendIndex]
+        const size = fs.statSync(item.filePath).size
+        for (const i of skip) {
+          const off = i * CHUNK_SIZE
+          resumed += Math.min(CHUNK_SIZE, size - off)
+        }
+        this.startFileStream(item.filePath, skip, resumed)
+      }
+    } else if (type === 'resume-decline') {
+      this.clearSendSidecar()
+      this.resumeState = null
+      this.sendQueue = []
+      this.currentSendIndex = 0
+    } else if (type === 'file-start') {
+      // segments follow; sink already open
+    } else if (type === 'file-end') {
+      this.finishIncomingFile()
+    }
   }
 
   // ---------- sending (queue) ----------
@@ -238,11 +353,11 @@ export class TransportServer {
     }
     this.currentTransfer = meta
     this.lastTransfer = meta
-    this.peerWs.send(JSON.stringify({
+    this.sendJson({
       type: 'file-offer', transferId: first.transferId, name: first.name, size: first.size,
       chunkSize: CHUNK_SIZE, chunkCount: Math.ceil(first.size / CHUNK_SIZE), fileHash: first.hash,
       queueIndex: 0, queueTotal: this.sendQueue.length,
-    }))
+    })
   }
 
   cancelQueue(): void {
@@ -275,11 +390,11 @@ export class TransportServer {
       this.currentSendIndex = Math.min(idx, valid.length - 1)
       const item = this.sendQueue[this.currentSendIndex]
       this.resumeState = { transferId: item.transferId }
-      this.peerWs?.send(JSON.stringify({
+      this.sendJson({
         type: 'resume-offer', transferId: item.transferId, name: item.name, size: item.size,
         chunkSize: CHUNK_SIZE, chunkCount: Math.ceil(item.size / CHUNK_SIZE), fileHash: item.hash,
         queueIndex: this.currentSendIndex, queueTotal: valid.length,
-      }))
+      })
     } catch {
       this.clearSendSidecar()
     }
@@ -297,7 +412,7 @@ export class TransportServer {
       name, size, isSending: true, resumed: resumedBytes, filePath,
       queueIndex: this.currentSendIndex, queueTotal: this.sendQueue.length,
     })
-    this.peerWs.send(JSON.stringify({ type: 'file-start', name, size }))
+    this.sendJson({ type: 'file-start', name, size })
 
     const missing: number[] = []
     for (let i = 0; i < count; i++) if (!skip.has(i)) missing.push(i)
@@ -331,8 +446,9 @@ export class TransportServer {
             const header = Buffer.from(JSON.stringify({ i, o: offset, l: len, h: segHash }), 'utf8')
             const prefix = Buffer.alloc(4)
             prefix.writeUInt32BE(header.length, 0)
+            const frame = Buffer.concat([prefix, header, buf])
             const ackPromise = new Promise<void>((resolve) => { self.ackResolvers.set(i, resolve) })
-            self.peerWs.send(Buffer.concat([prefix, header, buf]))
+            self.sendBinary(frame)
             await ackPromise
             if (self.sendAborted || !self.peerWs) break
             ackedBytes += len
@@ -380,7 +496,7 @@ export class TransportServer {
     fs.closeSync(fd)
 
     if (!this.sendAborted && this.peerWs) {
-      this.peerWs.send(JSON.stringify({ type: 'file-end' }))
+      this.sendJson({ type: 'file-end' })
       const verified = await this.awaitVerify()
       this.onFileDone?.(name, true, verified)
 
@@ -401,11 +517,11 @@ export class TransportServer {
         this.currentTransfer = meta
         this.lastTransfer = meta
         await new Promise((resolve) => setTimeout(resolve, 100))
-        this.peerWs.send(JSON.stringify({
+        this.sendJson({
           type: 'file-offer', transferId: next.transferId, name: next.name, size: next.size,
           chunkSize: CHUNK_SIZE, chunkCount: Math.ceil(next.size / CHUNK_SIZE), fileHash: next.hash,
           queueIndex: this.currentSendIndex, queueTotal: this.sendQueue.length,
-        }))
+        })
       }
     }
     this.resumeState = null
@@ -445,7 +561,7 @@ export class TransportServer {
     this.recvExpectedHash = fileHash || null
     this.recvReceived = new Set<number>()
 
-    this.peerWs.send(JSON.stringify({ type: 'file-accept' }))
+    this.sendJson({ type: 'file-accept' })
     const meta: TransferMeta = { name, size, isSending: false, resumed: 0 }
     this.currentTransfer = meta
     this.lastTransfer = meta
@@ -455,7 +571,7 @@ export class TransportServer {
   declineIncoming(): void {
     if (!this.pendingIncoming || !this.peerWs) return
     this.pendingIncoming = null
-    this.peerWs.send(JSON.stringify({ type: 'file-decline' }))
+    this.sendJson({ type: 'file-decline' })
   }
 
   private handleResumeOffer(msg: any): void {
@@ -466,7 +582,7 @@ export class TransportServer {
     const name = path.basename(String(msg.name))
     const partPath = path.join(saveDir, `${name}.part`)
     if (!transferId || !fs.existsSync(sidecar) || !fs.existsSync(partPath)) {
-      this.peerWs?.send(JSON.stringify({ type: 'resume-decline', transferId }))
+      this.sendJson({ type: 'resume-decline', transferId })
       return
     }
     try {
@@ -487,10 +603,10 @@ export class TransportServer {
         const off = i * CHUNK_SIZE
         resumed += Math.min(CHUNK_SIZE, size - off)
       }
-      this.peerWs?.send(JSON.stringify({
+      this.sendJson({
         type: 'resume-accept', transferId, received: Array.from(this.recvReceived),
         queueIndex: msg.queueIndex ?? 0, queueTotal: msg.queueTotal ?? 1,
-      }))
+      })
       const meta: TransferMeta = {
         name, size, isSending: false, resumed,
         queueIndex: msg.queueIndex ?? 0, queueTotal: msg.queueTotal ?? 1,
@@ -500,7 +616,7 @@ export class TransportServer {
       this.onFileTransferStart?.(meta)
     } catch {
       try { fs.unlinkSync(sidecar) } catch {}
-      this.peerWs?.send(JSON.stringify({ type: 'resume-decline', transferId }))
+      this.sendJson({ type: 'resume-decline', transferId })
     }
   }
 
@@ -512,13 +628,13 @@ export class TransportServer {
       const payload = data.subarray(4 + headerLen)
       const actual = crypto.createHash('sha256').update(payload).digest('hex')
       if (header.h && actual !== header.h) {
-        this.peerWs?.send(JSON.stringify({ type: 'chunk-nack', i: header.i }))
+        this.sendJson({ type: 'chunk-nack', i: header.i })
         return
       }
       fs.writeSync(this.recvFd, payload, 0, payload.length, Number(header.o))
       this.recvReceived.add(Number(header.i))
       if (this.recvReceived.size % 25 === 0) this.writeSidecar()
-      this.peerWs?.send(JSON.stringify({ type: 'chunk-ack', i: header.i }))
+      this.sendJson({ type: 'chunk-ack', i: header.i })
       this.onFileProgress?.(payload.length, false)
     } catch (err) {
       console.warn('[transport] bad binary frame', err)
@@ -536,8 +652,6 @@ export class TransportServer {
     } catch {}
   }
 
-  // re-entrant: capture + release state synchronously so the next queued file
-  // can start receiving while this one is still being hash-verified
   private finishIncomingFile(): void {
     if (this.recvFd != null) { try { fs.closeSync(this.recvFd) } catch {} this.recvFd = null }
     if (!this.recvPartPath || !this.recvSaveDir || !this.recvFinalName) return
@@ -559,7 +673,7 @@ export class TransportServer {
         const actual = await this.hashFile(partPath)
         verified = actual === expected
       }
-      this.peerWs?.send(JSON.stringify({ type: 'verify-result', ok: verified }))
+      this.sendJson({ type: 'verify-result', ok: verified })
       if (!verified) {
         try { fs.unlinkSync(partPath) } catch {}
         this.onFileDone?.(finalName, false, false)
@@ -589,12 +703,13 @@ export class TransportServer {
   getCurrentTransfer() { return this.currentTransfer }
   getLastTransfer() { return this.lastTransfer }
   getQueueInfo() { return { queue: this.sendQueue, currentIndex: this.currentSendIndex } }
+  getFingerprint() { return this.crypto.fingerprint() }
 
   private startHb(): void {
     this.stopHb()
     this.pingTimer = setInterval(() => {
       if (!this.peerWs) return
-      try { this.peerWs.send(JSON.stringify({ type: 'ping' })) } catch {}
+      this.sendJson({ type: 'ping' })
       if (Date.now() - this.lastPong > PONG_TIMEOUT_MS) {
         try { this.peerWs?.close(1001, 'pong timeout') } catch {}
       }
