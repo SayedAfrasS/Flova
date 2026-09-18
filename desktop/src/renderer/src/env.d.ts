@@ -1,8 +1,7 @@
 /**
  * WORKFLOW OF THIS FILE:
  * 1. Declares the window.flova API types for strict renderer type checking.
- * 2. Includes the history rows returned by the SQLite store.
- * 3. Includes getProgress to read current bytes from the transport layer.
+ * 2. Includes the new getFingerprint method for the encrypted session.
  */
 export {}
 
@@ -12,6 +11,7 @@ declare global {
       getServer: () => Promise<{ host: string; port: number }>
       getState: () => Promise<'waiting' | 'paired'>
       getPeerName: () => Promise<string | null>
+      getFingerprint: () => Promise<string>
       onPeerConnected: (cb: (name: string) => void) => () => void
       onPeerDisconnected: (cb: () => void) => () => void
 
@@ -28,13 +28,12 @@ declare global {
       onIncomingOffer: (cb: (d: { name: string; size: number }) => void) => () => void
       onSendAccepted: (cb: () => void) => () => void
       onSendDeclined: (cb: () => void) => () => void
-      onFileTransferStart: (cb: (m: { name: string; size: number; isSending: boolean; resumed?: number; queueIndex?: number; queueTotal?: number }) => void) => () => void
+      onFileTransferStart: (cb: (m: any) => void) => () => void
       onFileProgress: (cb: (d: { bytes: number; isSending: boolean }) => void) => () => void
       onFileDone: (cb: (d: { name: string; isSending: boolean; verified: boolean }) => void) => () => void
       onQueueAdvance: (cb: (d: { completed: number; total: number }) => void) => () => void
-      getCurrentTransfer: () => Promise<{ name: string; size: number; isSending: boolean; verified?: boolean; resumed?: number; queueIndex?: number; queueTotal?: number } | null>
-      getLastTransfer: () => Promise<{ name: string; size: number; isSending: boolean; verified?: boolean; resumed?: number } | null>
-      getProgress: () => Promise<{ bytes: number; isSending: boolean } | null>
+      getCurrentTransfer: () => Promise<any | null>
+      getLastTransfer: () => Promise<any | null>
       getHistory: () => Promise<{ id: number; name: string; size: number; direction: string; ok: number; ts: number }[]>
     }
   }

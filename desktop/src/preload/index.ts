@@ -1,9 +1,8 @@
 /**
  * WORKFLOW OF THIS FILE:
  * 1. Preload bridge between main process and renderer.
- * 2. Exposes network, file, transfer-event and history APIs as window.flova.
+ * 2. Exposes network, file, transfer-event, history and fingerprint APIs.
  * 3. Event subscriptions return unsubscribe functions for clean effects.
- * 4. getProgress reads current bytes from the transport layer.
  */
 import { contextBridge, ipcRenderer } from 'electron'
 
@@ -11,6 +10,7 @@ const api = {
   getServer: () => ipcRenderer.invoke('net:getServer'),
   getState: () => ipcRenderer.invoke('net:getState'),
   getPeerName: () => ipcRenderer.invoke('net:getPeerName'),
+  getFingerprint: () => ipcRenderer.invoke('net:getFingerprint'),
   onPeerConnected: (callback: (peerName: string) => void) => {
     const listener = (_event: any, peerName: string) => callback(peerName)
     ipcRenderer.on('net:peer-connected', listener)
@@ -47,29 +47,28 @@ const api = {
     ipcRenderer.on('file:send-declined', listener)
     return () => ipcRenderer.removeListener('file:send-declined', listener)
   },
-  onFileTransferStart: (callback: (meta: { name: string; size: number; isSending: boolean; resumed?: number; queueIndex?: number; queueTotal?: number }) => void) => {
+  onFileTransferStart: (callback: (meta: any) => void) => {
     const listener = (_event: any, meta: any) => callback(meta)
     ipcRenderer.on('file:transfer-start', listener)
     return () => ipcRenderer.removeListener('file:transfer-start', listener)
   },
   onFileProgress: (callback: (data: { bytes: number; isSending: boolean }) => void) => {
-    const listener = (_event: any, data: { bytes: number; isSending: boolean }) => callback(data)
+    const listener = (_event: any, data: any) => callback(data)
     ipcRenderer.on('file:progress', listener)
     return () => ipcRenderer.removeListener('file:progress', listener)
   },
   onFileDone: (callback: (data: { name: string; isSending: boolean; verified: boolean }) => void) => {
-    const listener = (_event: any, data: { name: string; isSending: boolean; verified: boolean }) => callback(data)
+    const listener = (_event: any, data: any) => callback(data)
     ipcRenderer.on('file:done', listener)
     return () => ipcRenderer.removeListener('file:done', listener)
   },
   onQueueAdvance: (callback: (data: { completed: number; total: number }) => void) => {
-    const listener = (_event: any, data: { completed: number; total: number }) => callback(data)
+    const listener = (_event: any, data: any) => callback(data)
     ipcRenderer.on('file:queue-advance', listener)
     return () => ipcRenderer.removeListener('file:queue-advance', listener)
   },
   getCurrentTransfer: () => ipcRenderer.invoke('file:getCurrentTransfer'),
   getLastTransfer: () => ipcRenderer.invoke('file:getLastTransfer'),
-  getProgress: () => ipcRenderer.invoke('file:getProgress'),
   getHistory: () => ipcRenderer.invoke('history:list'),
 }
 
