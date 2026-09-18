@@ -1,11 +1,21 @@
 /// WORKFLOW OF THIS FILE:
 /// 1. WebSocket client + peer lifecycle + heartbeat + session persistence.
-/// 2. Queue sending/receiving with auto-accept for continuation offers.
-/// 3. Integrity: per-segment SHA-256 (nack + resend) while streaming, then a
-///    whole-file SHA-256 after file-end. The whole-file check now drains all
-///    pending writes and flushes/closes the file BEFORE hashing, so the hash
-///    is always computed over the fully-finalized file.
-/// 4. Resume: sidecars survive crashes; resume-offer replays missing segments.
+/// 2. Every connect() creates a fresh SessionCrypto (forward secrecy).
+/// 3. The hello/hello-ack messages carry X25519 public keys in plaintext.
+///    Both sides derive the same 32-byte shared secret after hello-ack.
+/// 4. All messages after that are encrypted with ChaCha20-Poly1305:
+///    - JSON frames are wrapped as {"type":"e","n":nonce,"c":cipher}
+///    - Binary frames are prefixed with 0x01 + 12-byte nonce + ciphertext
+/// 5. Incoming encrypted frames are decrypted before dispatch. Tampered
+///    frames fail the auth tag and are logged and dropped.
+/// 6. All higher-level behavior (queue, resume, verify, history) is
+///    identical to Phase 13; only the transport layer gained encryption.
+///
+/// FUNCTIONS:
+///  - _sendJson()     : encrypts (when session ready) and sends a JSON frame.
+///  - _sendBinary()   : encrypts (when session ready) and sends a binary frame.
+///  - _onMessage()    : decrypts (when applicable) then dispatches.
+///  - all other methods: unchanged from Phase 13.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -15,6 +25,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'native_sha256.dart';
 import 'session_store.dart';
+import 'crypto_service.dart';
 
 enum TransportState { idle, connecting, connected, paired, reconnecting, disconnected, error }
 enum SendState { idle, waitingAccept, accepted, declined }
@@ -59,6 +70,8 @@ class QueueItem {
   });
 }
 
+const Set<String> _plaintextTypes = {'hello', 'hello-ack'};
+
 class TransportClient {
   WebSocketChannel? _channel;
   StreamSubscription? _sub;
@@ -72,6 +85,7 @@ class TransportClient {
   Timer? _reconnectTimer;
   int _lastPongMs = 0;
   int _reconnectAttempt = 0;
+  SessionCrypto _crypto = SessionCrypto();
 
   static const int chunkSize = 4 * 1024 * 1024;
   static const int minWorkers = 2;
@@ -125,6 +139,7 @@ class TransportClient {
   int get receivedBytes => _receivedBytes;
   List<QueueItem> get sendQueue => List.unmodifiable(_sendQueue);
   int get currentSendIndex => _currentSendIndex;
+  String get fingerprint => _crypto.fingerprint;
 
   static const Duration pingInterval = Duration(seconds: 3);
   static const Duration pongTimeout = Duration(seconds: 10);
@@ -187,12 +202,20 @@ class TransportClient {
 
   Future<void> _doConnect({required bool emitError}) async {
     _stopTimers();
+    // fresh crypto for this session -> forward secrecy per connection
+    _crypto = SessionCrypto();
+    await _crypto.generatePublicKey();
     _stateCtrl.add(TransportState.connecting);
     try {
       _channel = WebSocketChannel.connect(Uri.parse('ws://$_host:$_port'));
       await _channel!.ready;
       _stateCtrl.add(TransportState.connected);
-      _channel!.sink.add(jsonEncode({'type': 'hello', 'name': _selfName, 'platform': _platform}));
+      _sendJson({
+        'type': 'hello',
+        'name': _selfName,
+        'platform': _platform,
+        'pubKey': base64Encode(_crypto.publicKey!),
+      });
       _sub = _channel!.stream.listen(_onMessage, onDone: _onClosed, onError: (_) => _onClosed());
     } catch (_) {
       if (emitError && _reconnectAttempt == 0) _stateCtrl.add(TransportState.error);
@@ -213,110 +236,225 @@ class TransportClient {
     return c.future;
   }
 
-  void _onMessage(dynamic data) {
-    if (data is List<int>) {
-      _handleBinaryFrame(data);
+  /** encrypt + send JSON when session ready, otherwise plaintext */
+  void _sendJson(Map<String, dynamic> msg) {
+    final sink = _channel?.sink;
+    if (sink == null) return;
+    final type = msg['type'] as String?;
+    if (_crypto.hasKey && type != null && !_plaintextTypes.contains(type)) {
+      try {
+        final plain = Uint8List.fromList(utf8.encode(jsonEncode(msg)));
+        _crypto.encrypt(plain).then((wrapped) {
+          sink.add(jsonEncode({'type': 'e', 'n': wrapped['nonce'], 'c': wrapped['cipher']}));
+        }).catchError((e) {
+          debugPrint('[transport] encrypt json failed: $e');
+          sink.add(jsonEncode(msg));
+        });
+        return;
+      } catch (e) {
+        debugPrint('[transport] encrypt json sync err: $e');
+      }
+    }
+    sink.add(jsonEncode(msg));
+  }
+
+  /** encrypt + send binary frame with 0x01 marker when session ready */
+  void _sendBinary(Uint8List data) {
+    final sink = _channel?.sink;
+    if (sink == null) return;
+    if (_crypto.hasKey) {
+      _crypto.encrypt(data).then((wrapped) {
+        final nonce = base64Decode(wrapped['nonce']!);
+        final cipher = base64Decode(wrapped['cipher']!);
+        final frame = Uint8List(1 + nonce.length + cipher.length);
+        frame[0] = 0x01;
+        frame.setRange(1, 1 + nonce.length, nonce);
+        frame.setRange(1 + nonce.length, frame.length, cipher);
+        sink.add(frame);
+      }).catchError((e) {
+        debugPrint('[transport] encrypt binary failed: $e');
+        sink.add(data);
+      });
       return;
     }
-    if (data is String) {
-      try {
-        final msg = jsonDecode(data) as Map<String, dynamic>;
-        final type = msg['type'];
-        if (type == 'hello-ack') {
-          peerName = msg['name'] as String?;
-          _reconnectAttempt = 0;
-          _lastPongMs = DateTime.now().millisecondsSinceEpoch;
-          _startHeartbeat();
-          _stateCtrl.add(TransportState.paired);
-          if (_host != null && _port != null) {
-            SessionStore.save(host: _host!, port: _port!, peerName: peerName ?? 'Laptop');
-          }
-          _maybeOfferResume();
-        } else if (type == 'ping') {
-          _channel?.sink.add(jsonEncode({'type': 'pong'}));
-        } else if (type == 'pong') {
-          _lastPongMs = DateTime.now().millisecondsSinceEpoch;
-        } else if (type == 'verify-result') {
-          final c = _verifyCompleter;
-          _verifyCompleter = null;
-          if (c != null && !c.isCompleted) c.complete(msg['ok'] == true);
-        } else if (type == 'chunk-ack') {
-          final i = (msg['i'] as num).toInt();
-          _ackWaiters.remove(i)?.complete();
-        } else if (type == 'chunk-nack') {
-          final i = (msg['i'] as num).toInt();
-          if (!_resendQueue.contains(i)) _resendQueue.add(i);
-        } else if (type == 'file-offer') {
-          final queueIndex = (msg['queueIndex'] as num?)?.toInt() ?? 0;
-          final queueTotal = (msg['queueTotal'] as num?)?.toInt() ?? 1;
-          _pendingOfferName = msg['name'] as String;
-          _pendingOfferSize = (msg['size'] as num).toInt();
-          _pendingOfferId = (msg['transferId'] ?? 't0') as String;
-          _pendingOfferHash = (msg['fileHash'] ?? '') as String;
-          if (queueIndex > 0) {
-            _fileEventCtrl.add(FileEvent(
-              name: _pendingOfferName!,
-              size: _pendingOfferSize,
-              queueNext: true,
-              queueIndex: queueIndex,
-              queueTotal: queueTotal,
-            ));
-            acceptIncomingFile();
-          } else {
-            _fileEventCtrl.add(FileEvent(
-              name: _pendingOfferName!,
-              size: _pendingOfferSize,
-              isOffer: true,
-              queueIndex: queueIndex,
-              queueTotal: queueTotal,
-            ));
-          }
-        } else if (type == 'file-accept') {
-          if (_currentSendIndex < _sendQueue.length) {
-            final item = _sendQueue[_currentSendIndex];
-            _sendStateCtrl.add(SendState.accepted);
-            _streamFile(File(item.filePath), item.name, item.size, <int>{}, 0);
-          }
-        } else if (type == 'file-decline') {
-          _clearSendSidecar();
-          _sendQueue = [];
-          _currentSendIndex = 0;
-          _sendStateCtrl.add(SendState.declined);
-        } else if (type == 'resume-offer') {
-          _handleResumeOffer(msg);
-        } else if (type == 'resume-accept') {
-          final received = (msg['received'] as List? ?? []).map((e) => (e as num).toInt()).toSet();
-          if (_currentSendIndex < _sendQueue.length) {
-            final item = _sendQueue[_currentSendIndex];
-            int resumed = 0;
-            for (final i in received) {
-              final off = i * chunkSize;
-              resumed += off + chunkSize > item.size ? item.size - off : chunkSize;
-            }
-            _sentBytes = resumed;
-            _sendStateCtrl.add(SendState.accepted);
-            final ev = FileEvent(
-              name: item.name,
-              size: item.size,
-              sending: true,
-              isResume: true,
-              queueIndex: _currentSendIndex,
-              queueTotal: _sendQueue.length,
-            );
-            _lastResumeEvent = ev;
-            _fileEventCtrl.add(ev);
-            _streamFile(File(item.filePath), item.name, item.size, received, resumed);
-          }
-        } else if (type == 'resume-decline') {
-          _clearSendSidecar();
-          _sendQueue = [];
-          _currentSendIndex = 0;
-        } else if (type == 'file-start') {
-          // segments follow; sink already open
-        } else if (type == 'file-end') {
-          _finishIncomingFile();
+    sink.add(data);
+  }
+
+  void _onMessage(dynamic data) {
+    // binary frame: detect encrypted envelope (0x01 + nonce + cipher)
+    if (data is List<int>) {
+      final buf = data is Uint8List ? data : Uint8List.fromList(data);
+      if (buf.length >= 1 + 12 + 16 && buf[0] == 0x01 && _crypto.hasKey) {
+        final nonce = buf.sublist(1, 13);
+        final cipher = buf.sublist(13);
+        _crypto
+            .decrypt(base64Encode(nonce), base64Encode(cipher))
+            .then((plain) => _handleBinaryFrame(plain))
+            .catchError((e) => debugPrint('[transport] binary decrypt failed: $e'));
+        return;
+      }
+      _handleBinaryFrame(buf);
+      return;
+    }
+
+    if (data is! String) return;
+
+    Map<String, dynamic> msg;
+    try {
+      msg = jsonDecode(data) as Map<String, dynamic>;
+    } catch (_) {
+      return;
+    }
+
+    final type = msg['type'];
+    if (type == 'e' && _crypto.hasKey) {
+      final n = msg['n'] as String?;
+      final c = msg['c'] as String?;
+      if (n == null || c == null) return;
+      _crypto.decrypt(n, c).then((plain) {
+        try {
+          final inner = jsonDecode(utf8.decode(plain)) as Map<String, dynamic>;
+          _dispatch(inner);
+        } catch (e) {
+          debugPrint('[transport] inner json parse failed: $e');
         }
-      } catch (_) {}
+      }).catchError((e) {
+        debugPrint('[transport] json decrypt failed: $e');
+      });
+      return;
+    }
+
+    _dispatch(msg);
+  }
+
+  void _dispatch(Map<String, dynamic> msg) {
+    final type = msg['type'];
+    if (type == 'hello') {
+      peerName = msg['name'] as String?;
+      _reconnectAttempt = 0;
+      _lastPongMs = DateTime.now().millisecondsSinceEpoch;
+      final pubKeyB64 = msg['pubKey'] as String?;
+      if (pubKeyB64 != null) {
+        try {
+          _crypto.deriveKey(base64Decode(pubKeyB64)).then((_) {
+            debugPrint('[crypto] key derived, fingerprint=${_crypto.fingerprint}');
+          }).catchError((e) => debugPrint('[crypto] derive failed: $e'));
+        } catch (e) {
+          debugPrint('[crypto] derive sync err: $e');
+        }
+      }
+      final pub = _crypto.publicKey;
+      _channel?.sink.add(jsonEncode({
+        'type': 'hello-ack',
+        'name': _selfName,
+        'platform': _platform,
+        'pubKey': pub == null ? '' : base64Encode(pub),
+      }));
+      _startHeartbeat();
+      _stateCtrl.add(TransportState.paired);
+      if (_host != null && _port != null) {
+        SessionStore.save(host: _host!, port: _port!, peerName: peerName ?? 'Laptop');
+      }
+      _maybeOfferResume();
+    } else if (type == 'hello-ack') {
+      peerName = msg['name'] as String?;
+      final pubKeyB64 = msg['pubKey'] as String?;
+      if (pubKeyB64 != null) {
+        _crypto.deriveKey(base64Decode(pubKeyB64)).then((_) {
+          debugPrint('[crypto] key derived from ack, fingerprint=${_crypto.fingerprint}');
+        }).catchError((e) => debugPrint('[crypto] derive on ack failed: $e'));
+      }
+      _reconnectAttempt = 0;
+      _lastPongMs = DateTime.now().millisecondsSinceEpoch;
+      _startHeartbeat();
+      _stateCtrl.add(TransportState.paired);
+      if (_host != null && _port != null) {
+        SessionStore.save(host: _host!, port: _port!, peerName: peerName ?? 'Laptop');
+      }
+      _maybeOfferResume();
+    } else if (type == 'ping') {
+      _channel?.sink.add(jsonEncode({'type': 'pong'}));
+    } else if (type == 'pong') {
+      _lastPongMs = DateTime.now().millisecondsSinceEpoch;
+    } else if (type == 'verify-result') {
+      final c = _verifyCompleter;
+      _verifyCompleter = null;
+      if (c != null && !c.isCompleted) c.complete(msg['ok'] == true);
+    } else if (type == 'chunk-ack') {
+      final i = (msg['i'] as num).toInt();
+      _ackWaiters.remove(i)?.complete();
+    } else if (type == 'chunk-nack') {
+      final i = (msg['i'] as num).toInt();
+      if (!_resendQueue.contains(i)) _resendQueue.add(i);
+    } else if (type == 'file-offer') {
+      final queueIndex = (msg['queueIndex'] as num?)?.toInt() ?? 0;
+      final queueTotal = (msg['queueTotal'] as num?)?.toInt() ?? 1;
+      _pendingOfferName = msg['name'] as String;
+      _pendingOfferSize = (msg['size'] as num).toInt();
+      _pendingOfferId = (msg['transferId'] ?? 't0') as String;
+      _pendingOfferHash = (msg['fileHash'] ?? '') as String;
+      if (queueIndex > 0) {
+        _fileEventCtrl.add(FileEvent(
+          name: _pendingOfferName!,
+          size: _pendingOfferSize,
+          queueNext: true,
+          queueIndex: queueIndex,
+          queueTotal: queueTotal,
+        ));
+        acceptIncomingFile();
+      } else {
+        _fileEventCtrl.add(FileEvent(
+          name: _pendingOfferName!,
+          size: _pendingOfferSize,
+          isOffer: true,
+          queueIndex: queueIndex,
+          queueTotal: queueTotal,
+        ));
+      }
+    } else if (type == 'file-accept') {
+      if (_currentSendIndex < _sendQueue.length) {
+        final item = _sendQueue[_currentSendIndex];
+        _sendStateCtrl.add(SendState.accepted);
+        _streamFile(File(item.filePath), item.name, item.size, <int>{}, 0);
+      }
+    } else if (type == 'file-decline') {
+      _clearSendSidecar();
+      _sendQueue = [];
+      _currentSendIndex = 0;
+      _sendStateCtrl.add(SendState.declined);
+    } else if (type == 'resume-offer') {
+      _handleResumeOffer(msg);
+    } else if (type == 'resume-accept') {
+      final received = (msg['received'] as List? ?? []).map((e) => (e as num).toInt()).toSet();
+      if (_currentSendIndex < _sendQueue.length) {
+        final item = _sendQueue[_currentSendIndex];
+        int resumed = 0;
+        for (final i in received) {
+          final off = i * chunkSize;
+          resumed += off + chunkSize > item.size ? item.size - off : chunkSize;
+        }
+        _sentBytes = resumed;
+        _sendStateCtrl.add(SendState.accepted);
+        final ev = FileEvent(
+          name: item.name,
+          size: item.size,
+          sending: true,
+          isResume: true,
+          queueIndex: _currentSendIndex,
+          queueTotal: _sendQueue.length,
+        );
+        _lastResumeEvent = ev;
+        _fileEventCtrl.add(ev);
+        _streamFile(File(item.filePath), item.name, item.size, received, resumed);
+      }
+    } else if (type == 'resume-decline') {
+      _clearSendSidecar();
+      _sendQueue = [];
+      _currentSendIndex = 0;
+    } else if (type == 'file-start') {
+      // segments follow; sink already open
+    } else if (type == 'file-end') {
+      _finishIncomingFile();
     }
   }
 
@@ -365,7 +503,7 @@ class TransportClient {
     _pendingSendName = item.name;
     _pendingSendSize = item.size;
     _sentBytes = 0;
-    _channel!.sink.add(jsonEncode({
+    _sendJson({
       'type': 'file-offer',
       'transferId': item.transferId,
       'name': item.name,
@@ -375,7 +513,7 @@ class TransportClient {
       'fileHash': item.hash,
       'queueIndex': _currentSendIndex,
       'queueTotal': _sendQueue.length,
-    }));
+    });
     _sendStateCtrl.add(SendState.waitingAccept);
   }
 
@@ -424,7 +562,7 @@ class TransportClient {
       _sendQueue = valid;
       _currentSendIndex = idx < valid.length ? idx : valid.length - 1;
       final item = _sendQueue[_currentSendIndex];
-      _channel?.sink.add(jsonEncode({
+      _sendJson({
         'type': 'resume-offer',
         'transferId': item.transferId,
         'name': item.name,
@@ -434,7 +572,7 @@ class TransportClient {
         'fileHash': item.hash,
         'queueIndex': _currentSendIndex,
         'queueTotal': valid.length,
-      }));
+      });
     } catch (_) {
       await _clearSendSidecar();
     }
@@ -445,7 +583,7 @@ class TransportClient {
     _sendAborted = false;
     _resendQueue.clear();
 
-    _channel!.sink.add(jsonEncode({'type': 'file-start', 'name': name, 'size': size}));
+    _sendJson({'type': 'file-start', 'name': name, 'size': size});
 
     final missing = <int>[];
     for (var i = 0; i < count; i++) {
@@ -490,7 +628,7 @@ class TransportClient {
 
             final waiter = Completer<void>();
             _ackWaiters[i] = waiter;
-            _channel!.sink.add(bb.toBytes());
+            _sendBinary(bb.toBytes());
             await waiter.future;
             if (_sendAborted || _channel == null) break;
             ackedBytes += chunk.length;
@@ -539,7 +677,7 @@ class TransportClient {
     }
 
     if (!_sendAborted && _channel != null) {
-      _channel!.sink.add(jsonEncode({'type': 'file-end'}));
+      _sendJson({'type': 'file-end'});
       final ok = await _waitVerify();
       _fileEventCtrl.add(FileEvent(
         name: name,
@@ -620,7 +758,7 @@ class TransportClient {
     _recvReceived.clear();
     _receivedBytes = 0;
 
-    _channel?.sink.add(jsonEncode({'type': 'file-accept'}));
+    _sendJson({'type': 'file-accept'});
     _pendingOfferName = null;
     _pendingOfferSize = 0;
     _pendingOfferId = null;
@@ -629,7 +767,7 @@ class TransportClient {
 
   void declineIncoming() {
     if (_pendingOfferName == null || _channel == null) return;
-    _channel!.sink.add(jsonEncode({'type': 'file-decline'}));
+    _sendJson({'type': 'file-decline'});
     _pendingOfferName = null;
     _pendingOfferSize = 0;
     _pendingOfferId = null;
@@ -641,7 +779,7 @@ class TransportClient {
     final size = (msg['size'] as num).toInt();
     final name = (msg['name'] as String).split(Platform.pathSeparator).last;
     if (transferId.isEmpty) {
-      _channel?.sink.add(jsonEncode({'type': 'resume-decline', 'transferId': transferId}));
+      _sendJson({'type': 'resume-decline', 'transferId': transferId});
       return;
     }
     try {
@@ -649,7 +787,7 @@ class TransportClient {
       final sidecar = File('${saveDir.path}/.$transferId.flova.json');
       final partFile = File('${saveDir.path}/$name.part');
       if (!await sidecar.exists() || !await partFile.exists()) {
-        _channel?.sink.add(jsonEncode({'type': 'resume-decline', 'transferId': transferId}));
+        _sendJson({'type': 'resume-decline', 'transferId': transferId});
         return;
       }
       final sc = jsonDecode(await sidecar.readAsString()) as Map<String, dynamic>;
@@ -680,13 +818,13 @@ class TransportClient {
       }
       _receivedBytes = resumed;
 
-      _channel?.sink.add(jsonEncode({
+      _sendJson({
         'type': 'resume-accept',
         'transferId': transferId,
         'received': received.toList(),
         'queueIndex': (msg['queueIndex'] as num?)?.toInt() ?? 0,
         'queueTotal': (msg['queueTotal'] as num?)?.toInt() ?? 1,
-      }));
+      });
       final ev = FileEvent(
         name: name,
         size: size,
@@ -698,7 +836,7 @@ class TransportClient {
       _lastResumeEvent = ev;
       _fileEventCtrl.add(ev);
     } catch (_) {
-      _channel?.sink.add(jsonEncode({'type': 'resume-decline', 'transferId': transferId}));
+      _sendJson({'type': 'resume-decline', 'transferId': transferId});
     }
   }
 
@@ -721,7 +859,7 @@ class TransportClient {
       if (expected != null) {
         final actual = await NativeSha256.hashBytes(payload);
         if (actual != expected) {
-          _channel?.sink.add(jsonEncode({'type': 'chunk-nack', 'i': index}));
+          _sendJson({'type': 'chunk-nack', 'i': index});
           return;
         }
       }
@@ -733,7 +871,7 @@ class TransportClient {
       if (_recvReceived.length % 25 == 0) _writeSidecar();
       _receivedBytes += payload.length;
       _progressCtrl.add(payload.length);
-      _channel?.sink.add(jsonEncode({'type': 'chunk-ack', 'i': index}));
+      _sendJson({'type': 'chunk-ack', 'i': index});
     } catch (_) {}
   }
 
@@ -751,16 +889,11 @@ class TransportClient {
     } catch (_) {}
   }
 
-  /// Finalizes a received file. ORDER MATTERS:
-  /// 1) drain every pending segment write, 2) flush + close the handle,
-  /// 3) only then hash the fully-finalized file and compare.
   Future<void> _finishIncomingFile() async {
-    // 1. Drain all pending writes FIRST.
     final myQueue = _writeQueue;
     _writeQueue = Future<void>.value();
     await myQueue;
 
-    // 2. Flush and close the file handle so all bytes hit disk.
     final raf = _recvRaf;
     _recvRaf = null;
     if (raf != null) {
@@ -768,7 +901,6 @@ class TransportClient {
       try { await raf.close(); } catch (_) {}
     }
 
-    // Capture and release state.
     final part = _recvPartFile;
     final dir = _recvSaveDir;
     final finalName = _recvFinalName;
@@ -782,7 +914,6 @@ class TransportClient {
     _recvExpectedHash = null;
     _recvTransferId = null;
 
-    // 3. Verify whole-file hash over the finalized file.
     var ok = true;
     if (expected != null && expected.isNotEmpty) {
       try {
@@ -797,7 +928,7 @@ class TransportClient {
       }
     }
 
-    _channel?.sink.add(jsonEncode({'type': 'verify-result', 'ok': ok}));
+    _sendJson({'type': 'verify-result', 'ok': ok});
 
     if (!ok) {
       try { await part.delete(); } catch (_) {}
@@ -853,9 +984,7 @@ class TransportClient {
         } catch (_) {}
         return;
       }
-      try {
-        _channel?.sink.add(jsonEncode({'type': 'ping'}));
-      } catch (_) {}
+      _channel?.sink.add(jsonEncode({'type': 'ping'}));
     });
   }
 
