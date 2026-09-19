@@ -4,8 +4,8 @@
 ///    package and returns the public key bytes to exchange in hello/hello-ack.
 /// 3. deriveKey() performs X25519 Diffie-Hellman to compute a shared 32-byte
 ///    secret that is identical on both devices.
-/// 4. encrypt() uses ChaCha20-Poly1305 and returns base64 strings (for JSON).
-/// 5. encryptRaw() uses ChaCha20-Poly1305 and returns raw bytes (for binary).
+/// 4. encrypt() uses AES-256-GCM and returns base64 strings (for JSON).
+/// 5. encryptRaw() uses AES-256-GCM and returns raw bytes (for binary).
 /// 6. decrypt() accepts base64 strings and returns plaintext bytes.
 /// 7. decryptRaw() accepts raw bytes and returns plaintext bytes.
 /// 8. fingerprint returns the first 4 bytes of the shared secret as an
@@ -55,7 +55,7 @@ class SessionCrypto {
   // For JSON frames: return base64 strings
   Future<Map<String, String>> encrypt(Uint8List plaintext) async {
     if (_sessionKey == null) throw Exception('session key not derived');
-    final algo = Chacha20.poly1305Aead();
+    final algo = AesGcm.with256bits();
     final box = await algo.encrypt(plaintext, secretKey: _sessionKey!);
     final cipherWithMac = Uint8List(box.cipherText.length + box.mac.bytes.length);
     cipherWithMac.setRange(0, box.cipherText.length, box.cipherText);
@@ -69,7 +69,7 @@ class SessionCrypto {
   // For binary frames: return raw bytes
   Future<EncryptedData> encryptRaw(Uint8List plaintext) async {
     if (_sessionKey == null) throw Exception('session key not derived');
-    final algo = Chacha20.poly1305Aead();
+    final algo = AesGcm.with256bits();
     final box = await algo.encrypt(plaintext, secretKey: _sessionKey!);
     final cipherWithMac = Uint8List(box.cipherText.length + box.mac.bytes.length);
     cipherWithMac.setRange(0, box.cipherText.length, box.cipherText);
@@ -80,7 +80,7 @@ class SessionCrypto {
   // For JSON frames: accept base64 strings
   Future<Uint8List> decrypt(String nonceB64, String cipherB64) async {
     if (_sessionKey == null) throw Exception('session key not derived');
-    final algo = Chacha20.poly1305Aead();
+    final algo = AesGcm.with256bits();
     final nonce = base64Decode(nonceB64);
     final cipherWithMac = base64Decode(cipherB64);
     const macLength = 16;
@@ -97,7 +97,7 @@ class SessionCrypto {
   // For binary frames: accept raw bytes
   Future<Uint8List> decryptRaw(Uint8List nonce, Uint8List cipherWithMac) async {
     if (_sessionKey == null) throw Exception('session key not derived');
-    final algo = Chacha20.poly1305Aead();
+    final algo = AesGcm.with256bits();
     const macLength = 16;
     if (cipherWithMac.length < macLength) {
       throw Exception('ciphertext too short');
