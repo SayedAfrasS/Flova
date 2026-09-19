@@ -1,5 +1,11 @@
+/// WORKFLOW OF THIS FILE:
+/// 1. Shows the incoming file offer with name, size, and Accept/Decline buttons.
+/// 2. On Accept, accepts the file and navigates to ProgressScreen.
+/// 3. On Decline, declines the file and pops back.
+/// 4. The onDismissed callback is safely deferred to avoid setState during disposal.
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import '../core/tokens.dart';
 import '../core/transfer.dart';
 import '../services/transport.dart';
@@ -31,7 +37,12 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
   @override
   void dispose() {
     _sub?.cancel();
-    widget.onDismissed?.call();
+    // Defer the callback to avoid setState during widget tree finalization
+    if (widget.onDismissed != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        widget.onDismissed!();
+      });
+    }
     super.dispose();
   }
 
@@ -69,7 +80,7 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
     final text = Theme.of(context).textTheme;
     return Scaffold(
       appBar: AppBar(
-        backgroundColor: FlovaTokens.canvas,
+        backgroundColor: FlovaTokens.canvas, 
         surfaceTintColor: Colors.transparent,
         title: const Text('Receive a file', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: FlovaTokens.ink)),
       ),
@@ -97,11 +108,11 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
   Widget _buildOffer(TextTheme text) {
     return Column(mainAxisSize: MainAxisSize.min, children: [
       Container(
-        width: 80,
+        width: 80, 
         height: 80,
         decoration: BoxDecoration(
-          color: FlovaTokens.surface,
-          border: Border.all(color: FlovaTokens.line),
+          color: FlovaTokens.surface, 
+          border: Border.all(color: FlovaTokens.line), 
           borderRadius: BorderRadius.circular(FlovaTokens.rCard)
         ),
         child: const Icon(Icons.description_outlined, size: 36, color: FlovaTokens.accent),
