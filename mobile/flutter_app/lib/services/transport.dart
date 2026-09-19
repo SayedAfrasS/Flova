@@ -4,14 +4,12 @@
 /// 3. hello/hello-ack carry X25519 public keys in plaintext; both sides then
 ///    derive the same 32-byte shared secret.
 /// 4. CRYPTO SAFETY: incoming messages are processed one-at-a-time through
-///    _recvQueue so the async key derivation is fully awaited before the next
-///    message is handled. Outgoing messages are serialized through _sendQueue
+///    _inQueue so the async key derivation is fully awaited before the next
+///    message is handled. Outgoing messages are serialized through _outQueue
 ///    so encrypted frames and control frames never overtake each other.
-///    This fixes the race where encrypted messages arrived before the key was
-///    ready and were silently dropped.
-/// 5. After the key is ready, JSON frames are wrapped as {"type":"e","n","c"}
-///    and binary frames as 0x01 + 12-byte nonce + ciphertext.
-/// 6. All higher-level behavior (queue, resume, verify, history) is unchanged.
+/// 5. JSON frames use base64 encoding: {"type":"e","n":nonce,"c":cipher}
+/// 6. Binary frames use raw bytes: 0x01 + 12-byte nonce + ciphertext (no base64)
+/// 7. All higher-level behavior (queue, resume, verify, history) is unchanged.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -84,8 +82,8 @@ class TransportClient {
   SessionCrypto _crypto = SessionCrypto();
 
   // Serialize incoming and outgoing messages to avoid crypto race conditions.
-  Future<void> _recvQueue = Future<void>.value();
-  Future<void> _sendQueue = Future<void>.value();
+  Future<void> _inQueue = Future<void>.value();
+  Future<void> _outQueue = Future<void>.value();
 
   static const int chunkSize = 4 * 1024 * 1024;
   static const int minWorkers = 2;
@@ -202,7 +200,6 @@ class TransportClient {
 
   Future<void> _doConnect({required bool emitError}) async {
     _stopTimers();
-    // fresh crypto for this session -> forward secrecy per connection
     _crypto = SessionCrypto();
     await _crypto.generatePublicKey();
     _stateCtrl.add(TransportState.connecting);
@@ -239,7 +236,7 @@ class TransportClient {
   // ---------- outgoing (serialized) ----------
 
   void _sendJson(Map<String, dynamic> msg) {
-    _sendQueue = _sendQueue.then((_) => _sendJsonInternal(msg));
+    _outQueue = _outQueue.then((_) => _sendJsonInternal(msg));
   }
 
   Future<void> _sendJsonInternal(Map<String, dynamic> msg) async {
@@ -261,7 +258,7 @@ class TransportClient {
   }
 
   void _sendBinary(Uint8List data) {
-    _sendQueue = _sendQueue.then((_) => _sendBinaryInternal(data));
+    _outQueue = _outQueue.then((_) => _sendBinaryInternal(data));
   }
 
   Future<void> _sendBinaryInternal(Uint8List data) async {
@@ -269,13 +266,12 @@ class TransportClient {
     if (sink == null) return;
     if (_crypto.hasKey) {
       try {
-        final wrapped = await _crypto.encrypt(data);
-        final nonce = base64Decode(wrapped['nonce']!);
-        final cipher = base64Decode(wrapped['cipher']!);
-        final frame = Uint8List(1 + nonce.length + cipher.length);
+        // Encrypt and get raw bytes (not base64) for binary frames
+        final encrypted = await _crypto.encryptRaw(data);
+        final frame = Uint8List(1 + encrypted.nonce.length + encrypted.ciphertext.length);
         frame[0] = 0x01;
-        frame.setRange(1, 1 + nonce.length, nonce);
-        frame.setRange(1 + nonce.length, frame.length, cipher);
+        frame.setRange(1, 1 + encrypted.nonce.length, encrypted.nonce);
+        frame.setRange(1 + encrypted.nonce.length, frame.length, encrypted.ciphertext);
         sink.add(frame);
         return;
       } catch (e) {
@@ -288,18 +284,19 @@ class TransportClient {
   // ---------- incoming (serialized so key derivation is awaited) ----------
 
   void _onMessage(dynamic data) {
-    _recvQueue = _recvQueue.then((_) => _processMessage(data));
+    _inQueue = _inQueue.then((_) => _processMessage(data));
   }
 
   Future<void> _processMessage(dynamic data) async {
-    // Binary frame: detect encrypted envelope (0x01 + nonce + cipher)
     if (data is List<int>) {
       final buf = data is Uint8List ? data : Uint8List.fromList(data);
+      // Binary frame: 0x01 + 12-byte nonce + ciphertext (raw bytes, no base64)
       if (buf.length >= 1 + 12 + 16 && buf[0] == 0x01 && _crypto.hasKey) {
         final nonce = buf.sublist(1, 13);
         final cipher = buf.sublist(13);
         try {
-          final plain = await _crypto.decrypt(base64Encode(nonce), base64Encode(cipher));
+          // Decrypt with raw bytes (not base64)
+          final plain = await _crypto.decryptRaw(nonce, cipher);
           _handleBinaryFrame(plain);
         } catch (e) {
           debugPrint('[transport] binary decrypt failed: $e');
@@ -339,7 +336,6 @@ class TransportClient {
   Future<void> _dispatch(Map<String, dynamic> msg) async {
     final type = msg['type'];
     if (type == 'hello') {
-      // Defensive: mobile normally sends hello, but handle it if received.
       peerName = msg['name'] as String?;
       _reconnectAttempt = 0;
       _lastPongMs = DateTime.now().millisecondsSinceEpoch;
@@ -370,7 +366,6 @@ class TransportClient {
       final pubKeyB64 = msg['pubKey'] as String?;
       if (pubKeyB64 != null && pubKeyB64.isNotEmpty) {
         try {
-          // Awaited so the key is guaranteed ready before any later message.
           await _crypto.deriveKey(base64Decode(pubKeyB64));
           debugPrint('[crypto] key derived from ack, fingerprint=${_crypto.fingerprint}');
         } catch (e) {
@@ -465,13 +460,12 @@ class TransportClient {
       _sendQueue = [];
       _currentSendIndex = 0;
     } else if (type == 'file-start') {
-      // segments follow; sink already open
+      // segments follow
     } else if (type == 'file-end') {
       _finishIncomingFile();
     }
   }
 
-  // ---------- sending (queue) ----------
   Future<void> sendMultipleFiles(List<File> files) async {
     if (_channel == null || files.isEmpty) return;
     _sendQueue = [];
@@ -729,7 +723,6 @@ class TransportClient {
     }
   }
 
-  // ---------- receiving ----------
   Future<void> acceptIncomingFile() async {
     if (_pendingOfferName == null) return;
     final saveDir = await _recvDir();
