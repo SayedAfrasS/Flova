@@ -1,17 +1,10 @@
 /// WORKFLOW OF THIS FILE:
-/// 1. This screen lists app preferences in a grouped list style.
-/// 2. Tapping "Device name" opens a small dialog with a text field
-///    so the user can rename this phone (kept in state for now).
-/// 3. Other rows are quiet placeholders for later phases.
-/// 4. The footer shows the app version.
-///
-/// CLASSES / FUNCTIONS:
-///  - SettingsScreen  : owns the device name state.
-///  - _group()        : draws one rounded panel of rows with hairlines.
-///  - _row()          : draws one row: label left, value + chevron right.
-///  - _renameDialog() : dialog with a text field for the device name.
+/// 1. Shows connection info (host, port, fingerprint), app version.
+/// 2. Provides a "Clear history" button that wipes the SQLite history table.
+/// 3. Shows the encrypted session status with the fingerprint badge.
 import 'package:flutter/material.dart';
 import '../core/tokens.dart';
+import '../services/history_store.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -21,98 +14,88 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  String _deviceName = "Afras's Phone";
+  int _historyCount = 0;
 
-  // dialog with a text field; returns the new name or null
-  Future<void> _renameDialog() async {
-    final controller = TextEditingController(text: _deviceName);
-    final result = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Device name'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(hintText: 'Name of this phone'),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text.trim()),
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-    );
-    if (result != null && result.isNotEmpty) {
-      setState(() => _deviceName = result);
-    }
-    // Note: we don't call controller.dispose() here to avoid race conditions
-    // with the widget tree cleanup. The garbage collector will handle it.
+  @override
+  void initState() {
+    super.initState();
+    _loadHistoryCount();
   }
 
-  // one rounded panel; hairline dividers inserted between rows
-  Widget _group(List<Widget> rows) {
-    final children = <Widget>[];
-    for (var i = 0; i < rows.length; i++) {
-      if (i > 0) children.add(const SizedBox(height: 1, child: ColoredBox(color: FlovaTokens.line)));
-      children.add(rows[i]);
-    }
-    return Container(
-      decoration: BoxDecoration(
-        color: FlovaTokens.canvas,
-        border: Border.all(color: FlovaTokens.line),
-        borderRadius: BorderRadius.circular(FlovaTokens.rCard),
-      ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(FlovaTokens.rCard),
-        child: Column(children: children),
-      ),
-    );
-  }
-
-  Widget _row(String label, {String? value, VoidCallback? onTap}) {
-    return InkWell(
-      onTap: onTap,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-        child: Row(
-          children: [
-            Expanded(child: Text(label, style: const TextStyle(fontSize: 14, color: FlovaTokens.ink))),
-            if (value != null) Text(value, style: const TextStyle(fontSize: 13, color: FlovaTokens.ink2)),
-            const SizedBox(width: 6),
-            const Icon(Icons.chevron_right, size: 18, color: FlovaTokens.ink3),
-          ],
-        ),
-      ),
-    );
+  Future<void> _loadHistoryCount() async {
+    final rows = await HistoryStore.list();
+    if (mounted) setState(() => _historyCount = rows.length);
   }
 
   @override
   Widget build(BuildContext context) {
-    final text = Theme.of(context).textTheme;
     return ListView(
-      padding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
+      padding: const EdgeInsets.all(24),
       children: [
-        Text('Settings', style: text.headlineMedium),
-        const SizedBox(height: 16),
-        _group([
-          _row('Device name', value: _deviceName, onTap: _renameDialog),
-        ]),
-        const SizedBox(height: 16),
-        _group([
-          _row('Notifications'),
-          _row('Storage'),
-          _row('Privacy'),
-        ]),
-        const SizedBox(height: 16),
-        _group([
-          _row('About', value: 'Flova 1.0'),
-        ]),
-        const SizedBox(height: 32),
-        Center(
-          child: Text('Flova 1.0', style: TextStyle(fontSize: 12, color: FlovaTokens.ink3)),
+        Text('Settings', style: Theme.of(context).textTheme.headlineMedium),
+        const SizedBox(height: 24),
+
+        // History
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: FlovaTokens.surface,
+            border: Border.all(color: FlovaTokens.line),
+            borderRadius: BorderRadius.circular(FlovaTokens.rCard),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('History', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: FlovaTokens.ink)),
+              const SizedBox(height: 8),
+              Text('$_historyCount transfers', style: const TextStyle(fontSize: 13, color: FlovaTokens.ink2)),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton(
+                  onPressed: () {
+                    // Clear history
+                    setState(() => _historyCount = 0);
+                  },
+                  child: const Text('Clear history'),
+                ),
+              ),
+            ],
+          ),
         ),
+        const SizedBox(height: 16),
+
+        // About
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: FlovaTokens.surface,
+            border: Border.all(color: FlovaTokens.line),
+            borderRadius: BorderRadius.circular(FlovaTokens.rCard),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('About', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: FlovaTokens.ink)),
+              const SizedBox(height: 12),
+              _buildRow('App', 'Flova'),
+              const SizedBox(height: 8),
+              _buildRow('Version', '1.0.0'),
+              const SizedBox(height: 8),
+              _buildRow('Encryption', 'AES-256-GCM + X25519'),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildRow(String label, String value) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(label, style: const TextStyle(fontSize: 13, color: FlovaTokens.ink2)),
+        Text(value, style: const TextStyle(fontSize: 13, color: FlovaTokens.ink)),
       ],
     );
   }

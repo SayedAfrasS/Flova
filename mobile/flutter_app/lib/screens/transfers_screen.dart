@@ -1,8 +1,7 @@
 /// WORKFLOW OF THIS FILE:
-/// 1. Transfers page shows history only (completed and failed transfers).
-/// 2. Rows are loaded from SQLite (HistoryStore) every time the page opens.
-/// 3. Each row shows a direction icon, name, size, time and status.
-/// 4. Shows a calm empty state when there is no history yet.
+/// 1. Shows the transfer history list from SQLite.
+/// 2. When history is empty, shows a calm, friendly empty state message.
+/// 3. Each row shows direction icon, name, size, time and status.
 import 'package:flutter/material.dart';
 import '../core/tokens.dart';
 import '../services/history_store.dart';
@@ -20,10 +19,10 @@ class _TransfersScreenState extends State<TransfersScreen> {
   @override
   void initState() {
     super.initState();
-    _reload();
+    _loadHistory();
   }
 
-  Future<void> _reload() async {
+  Future<void> _loadHistory() async {
     final rows = await HistoryStore.list();
     if (mounted) setState(() => _history = rows);
   }
@@ -50,13 +49,27 @@ class _TransfersScreenState extends State<TransfersScreen> {
       children: [
         Text('Transfers', style: Theme.of(context).textTheme.headlineMedium),
         const SizedBox(height: 16),
+
         if (_history.isEmpty)
           const Padding(
-            padding: EdgeInsets.symmetric(vertical: 32),
+            padding: EdgeInsets.symmetric(vertical: 48),
             child: Center(
-              child: Text(
-                'No transfers yet. Files you send or receive will appear here.',
-                style: TextStyle(fontSize: 13, color: FlovaTokens.ink3),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.inbox_outlined, size: 48, color: FlovaTokens.ink3),
+                  SizedBox(height: 16),
+                  Text(
+                    'No transfers yet',
+                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.w500, color: FlovaTokens.ink),
+                  ),
+                  SizedBox(height: 8),
+                  Text(
+                    'Files you send or receive\nwill appear here.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 13, color: FlovaTokens.ink3),
+                  ),
+                ],
               ),
             ),
           )
