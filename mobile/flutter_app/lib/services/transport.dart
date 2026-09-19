@@ -1,21 +1,17 @@
 /// WORKFLOW OF THIS FILE:
 /// 1. WebSocket client + peer lifecycle + heartbeat + session persistence.
 /// 2. Every connect() creates a fresh SessionCrypto (forward secrecy).
-/// 3. The hello/hello-ack messages carry X25519 public keys in plaintext.
-///    Both sides derive the same 32-byte shared secret after hello-ack.
-/// 4. All messages after that are encrypted with ChaCha20-Poly1305:
-///    - JSON frames are wrapped as {"type":"e","n":nonce,"c":cipher}
-///    - Binary frames are prefixed with 0x01 + 12-byte nonce + ciphertext
-/// 5. Incoming encrypted frames are decrypted before dispatch. Tampered
-///    frames fail the auth tag and are logged and dropped.
-/// 6. All higher-level behavior (queue, resume, verify, history) is
-///    identical to Phase 13; only the transport layer gained encryption.
-///
-/// FUNCTIONS:
-///  - _sendJson()     : encrypts (when session ready) and sends a JSON frame.
-///  - _sendBinary()   : encrypts (when session ready) and sends a binary frame.
-///  - _onMessage()    : decrypts (when applicable) then dispatches.
-///  - all other methods: unchanged from Phase 13.
+/// 3. hello/hello-ack carry X25519 public keys in plaintext; both sides then
+///    derive the same 32-byte shared secret.
+/// 4. CRYPTO SAFETY: incoming messages are processed one-at-a-time through
+///    _recvQueue so the async key derivation is fully awaited before the next
+///    message is handled. Outgoing messages are serialized through _sendQueue
+///    so encrypted frames and control frames never overtake each other.
+///    This fixes the race where encrypted messages arrived before the key was
+///    ready and were silently dropped.
+/// 5. After the key is ready, JSON frames are wrapped as {"type":"e","n","c"}
+///    and binary frames as 0x01 + 12-byte nonce + ciphertext.
+/// 6. All higher-level behavior (queue, resume, verify, history) is unchanged.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -86,6 +82,10 @@ class TransportClient {
   int _lastPongMs = 0;
   int _reconnectAttempt = 0;
   SessionCrypto _crypto = SessionCrypto();
+
+  // Serialize incoming and outgoing messages to avoid crypto race conditions.
+  Future<void> _recvQueue = Future<void>.value();
+  Future<void> _sendQueue = Future<void>.value();
 
   static const int chunkSize = 4 * 1024 * 1024;
   static const int minWorkers = 2;
@@ -236,34 +236,40 @@ class TransportClient {
     return c.future;
   }
 
-  /** encrypt + send JSON when session ready, otherwise plaintext */
+  // ---------- outgoing (serialized) ----------
+
   void _sendJson(Map<String, dynamic> msg) {
+    _sendQueue = _sendQueue.then((_) => _sendJsonInternal(msg));
+  }
+
+  Future<void> _sendJsonInternal(Map<String, dynamic> msg) async {
     final sink = _channel?.sink;
     if (sink == null) return;
     final type = msg['type'] as String?;
-    if (_crypto.hasKey && type != null && !_plaintextTypes.contains(type)) {
+    final shouldEncrypt = _crypto.hasKey && type != null && !_plaintextTypes.contains(type);
+    if (shouldEncrypt) {
       try {
         final plain = Uint8List.fromList(utf8.encode(jsonEncode(msg)));
-        _crypto.encrypt(plain).then((wrapped) {
-          sink.add(jsonEncode({'type': 'e', 'n': wrapped['nonce'], 'c': wrapped['cipher']}));
-        }).catchError((e) {
-          debugPrint('[transport] encrypt json failed: $e');
-          sink.add(jsonEncode(msg));
-        });
+        final wrapped = await _crypto.encrypt(plain);
+        sink.add(jsonEncode({'type': 'e', 'n': wrapped['nonce'], 'c': wrapped['cipher']}));
         return;
       } catch (e) {
-        debugPrint('[transport] encrypt json sync err: $e');
+        debugPrint('[transport] encrypt json failed, sending plaintext: $e');
       }
     }
     sink.add(jsonEncode(msg));
   }
 
-  /** encrypt + send binary frame with 0x01 marker when session ready */
   void _sendBinary(Uint8List data) {
+    _sendQueue = _sendQueue.then((_) => _sendBinaryInternal(data));
+  }
+
+  Future<void> _sendBinaryInternal(Uint8List data) async {
     final sink = _channel?.sink;
     if (sink == null) return;
     if (_crypto.hasKey) {
-      _crypto.encrypt(data).then((wrapped) {
+      try {
+        final wrapped = await _crypto.encrypt(data);
         final nonce = base64Decode(wrapped['nonce']!);
         final cipher = base64Decode(wrapped['cipher']!);
         final frame = Uint8List(1 + nonce.length + cipher.length);
@@ -271,26 +277,33 @@ class TransportClient {
         frame.setRange(1, 1 + nonce.length, nonce);
         frame.setRange(1 + nonce.length, frame.length, cipher);
         sink.add(frame);
-      }).catchError((e) {
-        debugPrint('[transport] encrypt binary failed: $e');
-        sink.add(data);
-      });
-      return;
+        return;
+      } catch (e) {
+        debugPrint('[transport] encrypt binary failed, sending raw: $e');
+      }
     }
     sink.add(data);
   }
 
+  // ---------- incoming (serialized so key derivation is awaited) ----------
+
   void _onMessage(dynamic data) {
-    // binary frame: detect encrypted envelope (0x01 + nonce + cipher)
+    _recvQueue = _recvQueue.then((_) => _processMessage(data));
+  }
+
+  Future<void> _processMessage(dynamic data) async {
+    // Binary frame: detect encrypted envelope (0x01 + nonce + cipher)
     if (data is List<int>) {
       final buf = data is Uint8List ? data : Uint8List.fromList(data);
       if (buf.length >= 1 + 12 + 16 && buf[0] == 0x01 && _crypto.hasKey) {
         final nonce = buf.sublist(1, 13);
         final cipher = buf.sublist(13);
-        _crypto
-            .decrypt(base64Encode(nonce), base64Encode(cipher))
-            .then((plain) => _handleBinaryFrame(plain))
-            .catchError((e) => debugPrint('[transport] binary decrypt failed: $e'));
+        try {
+          final plain = await _crypto.decrypt(base64Encode(nonce), base64Encode(cipher));
+          _handleBinaryFrame(plain);
+        } catch (e) {
+          debugPrint('[transport] binary decrypt failed: $e');
+        }
         return;
       }
       _handleBinaryFrame(buf);
@@ -298,7 +311,6 @@ class TransportClient {
     }
 
     if (data is! String) return;
-
     Map<String, dynamic> msg;
     try {
       msg = jsonDecode(data) as Map<String, dynamic>;
@@ -311,45 +323,42 @@ class TransportClient {
       final n = msg['n'] as String?;
       final c = msg['c'] as String?;
       if (n == null || c == null) return;
-      _crypto.decrypt(n, c).then((plain) {
-        try {
-          final inner = jsonDecode(utf8.decode(plain)) as Map<String, dynamic>;
-          _dispatch(inner);
-        } catch (e) {
-          debugPrint('[transport] inner json parse failed: $e');
-        }
-      }).catchError((e) {
+      try {
+        final plain = await _crypto.decrypt(n, c);
+        final inner = jsonDecode(utf8.decode(plain)) as Map<String, dynamic>;
+        await _dispatch(inner);
+      } catch (e) {
         debugPrint('[transport] json decrypt failed: $e');
-      });
+      }
       return;
     }
 
-    _dispatch(msg);
+    await _dispatch(msg);
   }
 
-  void _dispatch(Map<String, dynamic> msg) {
+  Future<void> _dispatch(Map<String, dynamic> msg) async {
     final type = msg['type'];
     if (type == 'hello') {
+      // Defensive: mobile normally sends hello, but handle it if received.
       peerName = msg['name'] as String?;
       _reconnectAttempt = 0;
       _lastPongMs = DateTime.now().millisecondsSinceEpoch;
       final pubKeyB64 = msg['pubKey'] as String?;
-      if (pubKeyB64 != null) {
+      if (pubKeyB64 != null && pubKeyB64.isNotEmpty) {
         try {
-          _crypto.deriveKey(base64Decode(pubKeyB64)).then((_) {
-            debugPrint('[crypto] key derived, fingerprint=${_crypto.fingerprint}');
-          }).catchError((e) => debugPrint('[crypto] derive failed: $e'));
+          await _crypto.deriveKey(base64Decode(pubKeyB64));
+          debugPrint('[crypto] key derived, fingerprint=${_crypto.fingerprint}');
         } catch (e) {
-          debugPrint('[crypto] derive sync err: $e');
+          debugPrint('[crypto] derive failed: $e');
         }
       }
       final pub = _crypto.publicKey;
-      _channel?.sink.add(jsonEncode({
+      _sendJson({
         'type': 'hello-ack',
         'name': _selfName,
         'platform': _platform,
         'pubKey': pub == null ? '' : base64Encode(pub),
-      }));
+      });
       _startHeartbeat();
       _stateCtrl.add(TransportState.paired);
       if (_host != null && _port != null) {
@@ -359,10 +368,14 @@ class TransportClient {
     } else if (type == 'hello-ack') {
       peerName = msg['name'] as String?;
       final pubKeyB64 = msg['pubKey'] as String?;
-      if (pubKeyB64 != null) {
-        _crypto.deriveKey(base64Decode(pubKeyB64)).then((_) {
+      if (pubKeyB64 != null && pubKeyB64.isNotEmpty) {
+        try {
+          // Awaited so the key is guaranteed ready before any later message.
+          await _crypto.deriveKey(base64Decode(pubKeyB64));
           debugPrint('[crypto] key derived from ack, fingerprint=${_crypto.fingerprint}');
-        }).catchError((e) => debugPrint('[crypto] derive on ack failed: $e'));
+        } catch (e) {
+          debugPrint('[crypto] derive on ack failed: $e');
+        }
       }
       _reconnectAttempt = 0;
       _lastPongMs = DateTime.now().millisecondsSinceEpoch;
@@ -373,7 +386,7 @@ class TransportClient {
       }
       _maybeOfferResume();
     } else if (type == 'ping') {
-      _channel?.sink.add(jsonEncode({'type': 'pong'}));
+      _sendJson({'type': 'pong'});
     } else if (type == 'pong') {
       _lastPongMs = DateTime.now().millisecondsSinceEpoch;
     } else if (type == 'verify-result') {
@@ -401,7 +414,7 @@ class TransportClient {
           queueIndex: queueIndex,
           queueTotal: queueTotal,
         ));
-        acceptIncomingFile();
+        await acceptIncomingFile();
       } else {
         _fileEventCtrl.add(FileEvent(
           name: _pendingOfferName!,
@@ -418,12 +431,12 @@ class TransportClient {
         _streamFile(File(item.filePath), item.name, item.size, <int>{}, 0);
       }
     } else if (type == 'file-decline') {
-      _clearSendSidecar();
+      await _clearSendSidecar();
       _sendQueue = [];
       _currentSendIndex = 0;
       _sendStateCtrl.add(SendState.declined);
     } else if (type == 'resume-offer') {
-      _handleResumeOffer(msg);
+      await _handleResumeOffer(msg);
     } else if (type == 'resume-accept') {
       final received = (msg['received'] as List? ?? []).map((e) => (e as num).toInt()).toSet();
       if (_currentSendIndex < _sendQueue.length) {
@@ -448,7 +461,7 @@ class TransportClient {
         _streamFile(File(item.filePath), item.name, item.size, received, resumed);
       }
     } else if (type == 'resume-decline') {
-      _clearSendSidecar();
+      await _clearSendSidecar();
       _sendQueue = [];
       _currentSendIndex = 0;
     } else if (type == 'file-start') {
@@ -984,7 +997,7 @@ class TransportClient {
         } catch (_) {}
         return;
       }
-      _channel?.sink.add(jsonEncode({'type': 'ping'}));
+      _sendJson({'type': 'ping'});
     });
   }
 
